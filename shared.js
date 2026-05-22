@@ -1,0 +1,2440 @@
+  // ── In-memory token state ──────────────────────────────────────────────────
+  let _token         = null;
+  let _tokenExpiry   = null;
+  let _portalUsername = '';
+
+  // ── Pagination state ───────────────────────────────────────────────────────
+  const PAGE_SIZE  = 25;
+  let _allResults    = [];
+  let _unresolvedIntersections = [];
+  let _currentPage   = 0;
+  let _allRouteIds        = new Set(); // pre-fetched AllRoads RouteIDs from layer 116
+  let _routeDirectionCache = new Map(); // routeNum → { from, to }
+  let _hslLengths        = null;       // cached result of hsl_computeLengths for current dataset
+  let _hslPageStarts     = null;       // cached result of hsl_computePageStarts for current dataset
+  let _countyNameToCode  = new Map(); // county name → 3-letter County_Code for layer 151
+  let _generatedOn   = '';
+
+  function startThinking(btn) {
+    if (btn._thinkingTimer) { clearInterval(btn._thinkingTimer); btn._thinkingTimer = null; }
+    const phrases = [
+      'Poking the database',
+      'Crunching the numbers',
+      'Asking the interwebs',
+      'Doing math stuff',
+      'Feeding the hamsters',
+      'Chewing on that',
+      'Phoning a friend',
+      'Checking with Jaime'
+    ];
+    const phrase = phrases[Math.floor(Math.random() * phrases.length)];
+    const frames = [
+      phrase + '\u00A0\u00A0\u00A0',
+      phrase + '.\u00A0\u00A0',
+      phrase + '..\u00A0',
+      phrase + '...'
+    ];
+    let i = 0;
+    btn.textContent = frames[i];
+    btn._thinkingTimer = setInterval(() => {
+      i = (i + 1) % frames.length;
+      btn.textContent = frames[i];
+    }, 400);
+  }
+
+  function stopThinking(btn) {
+    if (btn._thinkingTimer) { clearInterval(btn._thinkingTimer); btn._thinkingTimer = null; }
+    btn.textContent = 'Generate';
+  }
+  let _routeLabel    = '';
+  let _directionFrom = '';
+  let _directionTo   = '';
+
+  // ── County codes ──────────────────────────────────────────────────────────
+  const COUNTY_CODES = [
+    {value:'ALA',display:'ALA'}, {value:'ALP',display:'ALP'}, {value:'AMA',display:'AMA'},
+    {value:'BUT',display:'BUT'}, {value:'CAL',display:'CAL'}, {value:'CC.',display:'CC' },
+    {value:'COL',display:'COL'}, {value:'DN.',display:'DN' }, {value:'ED.',display:'ED' },
+    {value:'FRE',display:'FRE'}, {value:'GLE',display:'GLE'}, {value:'HUM',display:'HUM'},
+    {value:'IMP',display:'IMP'}, {value:'INY',display:'INY'}, {value:'KER',display:'KER'},
+    {value:'KIN',display:'KIN'}, {value:'LA.',display:'LA' }, {value:'LAK',display:'LAK'},
+    {value:'LAS',display:'LAS'}, {value:'MAD',display:'MAD'}, {value:'MEN',display:'MEN'},
+    {value:'MER',display:'MER'}, {value:'MNO',display:'MNO'}, {value:'MOD',display:'MOD'},
+    {value:'MON',display:'MON'}, {value:'MPA',display:'MPA'}, {value:'MRN',display:'MRN'},
+    {value:'NAP',display:'NAP'}, {value:'NEV',display:'NEV'}, {value:'ORA',display:'ORA'},
+    {value:'PLA',display:'PLA'}, {value:'PLU',display:'PLU'}, {value:'RIV',display:'RIV'},
+    {value:'SAC',display:'SAC'}, {value:'SB.',display:'SB' }, {value:'SBD',display:'SBD'},
+    {value:'SBT',display:'SBT'}, {value:'SCL',display:'SCL'}, {value:'SCR',display:'SCR'},
+    {value:'SD.',display:'SD' }, {value:'SF.',display:'SF' }, {value:'SHA',display:'SHA'},
+    {value:'SIE',display:'SIE'}, {value:'SIS',display:'SIS'}, {value:'SJ.',display:'SJ' },
+    {value:'SLO',display:'SLO'}, {value:'SM.',display:'SM' }, {value:'SOL',display:'SOL'},
+    {value:'SON',display:'SON'}, {value:'STA',display:'STA'}, {value:'SUT',display:'SUT'},
+    {value:'TEH',display:'TEH'}, {value:'TRI',display:'TRI'}, {value:'TUL',display:'TUL'},
+    {value:'TUO',display:'TUO'}, {value:'VEN',display:'VEN'}
+  ];
+
+  // ── OAuth (ArcGIS implicit flow) ──────────────────────────────────────────
+
+  function login() {
+    const params = new URLSearchParams({
+      client_id:     CONFIG.oauthClientId,
+      response_type: 'token',
+      redirect_uri:  CONFIG.oauthRedirectUrl,
+      expiration:    '120'
+    });
+    window.location.href = `${CONFIG.oauthAuthorizeUrl}?${params}`;
+  }
+
+  function tokenIsValid() {
+    if (!_token) return false;
+    if (_tokenExpiry && Date.now() >= _tokenExpiry) { _token = null; return false; }
+    return true;
+  }
+
+
+async function loadCountyCodeDomain() {
+    try {
+      const resp = await fetch(`${CONFIG.featureServiceUrl}/151?f=json&token=${_token}`);
+      const data = await resp.json();
+      const field = (data.fields ?? []).find(f => f.name === 'County_Code');
+      const coded = field?.domain?.codedValues ?? [];
+      _countyNameToCode = new Map();
+      for (const cv of coded) {
+        _countyNameToCode.set(cv.name, cv.code); // full name  → code  (e.g. "Lake"  → "LAK")
+        _countyNameToCode.set(cv.code, cv.code); // code → code  (e.g. "LAK"  → "LAK")
+      }
+    } catch (e) {
+      console.warn('[loadCountyCodeDomain] error:', e.message);
+    }
+  }
+
+  /*
+   * Feature Service Layer Index Reference
+   * ─────────────────────────────────────
+   *  0   – Intersection geometry (point features)
+   *  116 – AllRoads (route geometry / LRS)
+   *  123 – Landmarks (EV_SHS_LANDMARK; County uses 3-char code e.g. 'LA.')
+   *  132 – Ramps (EV_SHS_RAMP; County uses 3-char code)
+   *  133 – Route Breaks (EV_SHS_ROUTE_BREAK; County uses 3-char code)
+   *  149 – Intersection AOI (area-of-interest polygon)
+   *  151 – Intersection Attributes (County_Code uses 3-char code e.g. 'LA.')
+   */
+
+  /**
+   * Resolves a county name or code to the 3-char code used by layers 123, 132, 133, and 151
+   * (e.g., "Los Angeles" → "LA.", "LA" → "LA.", "LA." → "LA.").
+   * Returns null when county is falsy.
+   */
+  function normalizeCountyCode(county) {
+    if (!county) return null;
+    const code = _countyNameToCode.get(county) ?? county;
+    return code.length === 2 ? code + '.' : code;
+  }
+
+  /**
+   * Returns true when a County_Code value stored in layer 85 matches a normalized
+   * county code from normalizeCountyCode().  Layer 85 omits the trailing period that
+   * normalizeCountyCode() appends for 2-char codes (e.g. 'SJ' stored vs 'SJ.' normalized),
+   * so we accept both with and without the trailing period.
+   */
+  function countyCodeMatches(storedCode, normalizedCode) {
+    if (!storedCode || !normalizedCode) return false;
+    const s = storedCode.trim();
+    return s === normalizedCode ||
+      (normalizedCode.endsWith('.') && s === normalizedCode.slice(0, -1)) ||
+      (!normalizedCode.endsWith('.') && s === normalizedCode + '.');
+  }
+
+  /**
+   * Splits an array into chunks of at most `size` elements.
+   * Used to stay within the feature service's max-record-count per request.
+   */
+  function chunkArray(arr, size) {
+    const chunks = [];
+    for (let i = 0; i < arr.length; i += size) {
+      chunks.push(arr.slice(i, i + size));
+    }
+    return chunks;
+  }
+
+  /**
+   * Builds a segment descriptor object from route/county/district and postmile range.
+   */
+  function makeSegment(fromPrimary, fromAlt, toPrimary, toAlt) {
+    const fromEff = fromPrimary ?? fromAlt;
+    const toEff   = toPrimary   ?? toAlt;
+    if (!fromEff || !toEff) return null;
+    const fromM = Math.min(fromEff.measure, fromAlt?.measure ?? fromEff.measure);
+    const toM   = Math.max(toEff.measure,   toAlt?.measure   ?? toEff.measure);
+    return { fromBest: { routeId: fromEff.routeId, measure: fromM },
+             toBest:   { routeId: toEff.routeId,   measure: toM   } };
+  }
+
+  function setAuthUI(authenticated) {
+    document.getElementById('loginPrompt').style.display  = authenticated ? 'none'  : 'block';
+    document.getElementById('modeSelector').style.display = authenticated ? 'block' : 'none';
+    document.getElementById('appForm').style.display      = 'none';
+    document.getElementById('controlsGrid').style.display = 'none';
+    if (authenticated) { loadVersions(); loadRouteList(); loadCountyCodeDomain(); }
+  }
+
+  function resetModeSelections() {
+    document.getElementById('districtSelect').value = '';
+    document.getElementById('districtSelect').classList.remove('has-value');
+    const countySel = document.getElementById('districtCountySelect');
+    countySel.innerHTML = '<option value="" disabled hidden selected>-- Select County --</option><option value="">-- ALL --</option>';
+    countySel.classList.remove('has-value');
+    countySel.disabled = true;
+    const routeSel = document.getElementById('districtRouteSelect');
+    routeSel.innerHTML = '<option value="" disabled hidden selected>-- Select Route --</option>';
+    routeSel.classList.remove('has-value');
+    routeSel.disabled = true;
+    document.getElementById('districtRouteBtn').disabled = true;
+  }
+
+  function selectMode(mode) {
+    resetModeSelections();
+    const report = document.getElementById('reportSelect').value;
+    const isHSL  = report === 'highway_sequence';
+    const isHL   = report === 'highway_log';
+    const isINX  = report === 'intersection_detail' || report === 'intersection_summary';
+    document.getElementById('appForm').style.display              = mode === 'routeMeasure' ? 'block' : 'none';
+    document.getElementById('controlsGrid').style.display         = 'grid';
+    const showDR = mode === 'districtRoute';
+    ['districtRow', 'districtCountyRow', 'districtRouteRow'].forEach(id => {
+      document.getElementById(id).style.display = showDR ? 'flex' : 'none';
+    });
+    document.getElementById('districtRouteBtn').style.display     = showDR ? 'inline-block' : 'none';
+    if (showDR) document.getElementById('districtRouteBtn').disabled = true;
+    document.getElementById('generateRow').style.display          = showDR ? 'flex' : 'none';
+    document.getElementById('onOffSection').style.display         = showDR && !isHSL && !isHL && !isINX ? 'flex' : 'none';
+    if (isHSL || isHL || isINX) {
+      document.getElementById('translateOnOffRow').style.display  = 'none';
+    } else {
+      document.getElementById('translateOnOffRow').style.display  = '';
+    }
+    document.getElementById('modeBtnRouteMeasure').classList.toggle('active', mode === 'routeMeasure');
+    document.getElementById('modeBtnDistrictRoute').classList.toggle('active', mode === 'districtRoute');
+    clearResults();
+  }
+
+  async function loadRouteList() {
+    const params = new URLSearchParams({
+      where:                '1=1',
+      outFields:            'RouteID',
+      returnDistinctValues: 'true',
+      returnGeometry:       'false',
+      ...versionParam(),
+      f:                    'json',
+      token:                _token
+    });
+    let data;
+    try {
+      const resp = await fetch(`${CONFIG.mapServiceUrl}/116/query?${params}`);
+      data = await resp.json();
+    } catch (e) {
+      console.warn('[loadRouteList] fetch error:', e.message);
+      return;
+    }
+    if (!Array.isArray(data.features)) {
+      console.warn('[loadRouteList] unexpected response:', data);
+      return;
+    }
+
+    for (const f of data.features) {
+      const rid = f.attributes?.RouteID;
+      if (rid) _allRouteIds.add(rid);
+    }
+  }
+
+  async function onDistrictChange() {
+    const districtSel = document.getElementById('districtSelect');
+    const district    = districtSel.value;
+    districtSel.classList.toggle('has-value', !districtSel.options[districtSel.selectedIndex]?.disabled);
+
+    const countySel  = document.getElementById('districtCountySelect');
+    const routeSel   = document.getElementById('districtRouteSelect');
+    const btn        = document.getElementById('districtRouteBtn');
+
+    // Reset county and route
+    countySel.innerHTML = '<option value="" disabled hidden selected>-- Select County --</option><option value="">-- ALL --</option>';
+    countySel.classList.remove('has-value');
+    countySel.disabled = true;
+    routeSel.innerHTML = '<option value="" disabled hidden selected>-- Select Route --</option>';
+    routeSel.classList.remove('has-value');
+    routeSel.disabled = true;
+    btn.disabled = true;
+
+    // If placeholder still selected, leave county/route disabled
+    if (districtSel.options[districtSel.selectedIndex]?.disabled) return;
+
+    countySel.innerHTML = '<option value="" disabled hidden selected>-- Loading counties\u2026 --</option>';
+
+    const params = new URLSearchParams({
+      where:                district ? `District = ${parseInt(district, 10)}` : '1=1',
+      outFields:            'County_Code',
+      returnDistinctValues: 'true',
+      returnGeometry:       'false',
+      orderByFields:        'County_Code ASC',
+      ...versionParam(),
+      f:                    'json',
+      token:                _token
+    });
+    let data;
+    try {
+      const resp = await fetch(`${CONFIG.featureServiceUrl}/85/query?${params}`);
+      data = await resp.json();
+    } catch (e) {
+      console.warn('[onDistrictChange] fetch error:', e.message);
+      countySel.innerHTML = '<option value="" disabled hidden selected>-- Error loading counties --</option>';
+      return;
+    }
+    const counties = Array.isArray(data.features)
+      ? data.features.map(f => f.attributes?.County_Code).filter(v => v != null).sort()
+      : [];
+    countySel.innerHTML = '<option value="" disabled hidden selected>-- Select County --</option><option value="">-- ALL --</option>';
+    for (const c of counties) {
+      const opt = document.createElement('option');
+      opt.value = c;
+      opt.textContent = c;
+      countySel.appendChild(opt);
+    }
+    countySel.disabled = false;
+  }
+
+  async function onCountyChange() {
+    const district  = document.getElementById('districtSelect').value;
+    const countySel = document.getElementById('districtCountySelect');
+    const county    = countySel.value;
+    const routeSel  = document.getElementById('districtRouteSelect');
+    const btn       = document.getElementById('districtRouteBtn');
+
+    countySel.classList.toggle('has-value', !countySel.options[countySel.selectedIndex]?.disabled);
+
+    // Reset route
+    routeSel.innerHTML = '<option value="" disabled hidden selected>-- Select Route --</option>';
+    routeSel.classList.remove('has-value');
+    routeSel.disabled = true;
+    btn.disabled = true;
+
+    // If county placeholder still selected, leave route disabled
+    if (countySel.options[countySel.selectedIndex]?.disabled) return;
+
+    // Query layer 85 (County Code) for distinct RouteIDs — this is the authoritative
+    // route registry for district/county combinations and includes routes like 58U
+    // that may have no landmarks in layer 123.
+    const districtFilter = district ? ` AND District = ${parseInt(district, 10)}` : '';
+    const countyFilter   = county   ? ` AND County_Code = '${county.replace(/'/g, "''")}'` : '';
+    const where = `RouteID LIKE 'SHS%'${districtFilter}${countyFilter}`;
+
+    const params = new URLSearchParams({
+      where,
+      outFields:            'RouteID',
+      returnDistinctValues: 'true',
+      returnGeometry:       'false',
+      orderByFields:        'RouteID ASC',
+      ...versionParam(),
+      f:                    'json',
+      token:                _token
+    });
+    let data;
+    try {
+      const resp = await fetch(`${CONFIG.featureServiceUrl}/85/query?${params}`);
+      data = await resp.json();
+    } catch (e) {
+      console.warn('[onCountyChange] fetch error:', e.message);
+      routeSel.innerHTML = '<option value="" disabled hidden>-- Error loading routes --</option>';
+      return;
+    }
+    if (data.error) {
+      const code = data.error.code;
+      if (code === 498 || code === 499) { _token = null; login(); return; }
+      console.warn('[onCountyChange] layer 85 error:', data.error.code, data.error.message);
+      routeSel.innerHTML = '<option value="" disabled hidden>-- Error loading routes --</option>';
+      return;
+    }
+    if (!Array.isArray(data.features)) {
+      routeSel.innerHTML = '<option value="" disabled hidden>-- No routes found --</option>';
+      return;
+    }
+
+    // Parse RouteIDs: SHS_299._P → '299', SHS_058U_P → '058U'. Skip _S routes.
+    const seen = new Set();
+    const routes = [];
+    for (const f of data.features) {
+      const rid = f.attributes?.RouteID;
+      if (!rid) continue;
+      const m = rid.match(/^SHS_(\d+)([A-Z.]?)_P$/);
+      if (!m) continue;
+      const numStr = m[1];
+      const sfx    = m[2];
+      const hasSfx = sfx && sfx !== '.';
+      const value  = hasSfx ? numStr + sfx : numStr;
+      const num    = parseInt(numStr, 10);
+      if (!seen.has(value)) { seen.add(value); routes.push({ value, label: value, num }); }
+    }
+    routes.sort((a, b) => a.num - b.num || a.label.localeCompare(b.label));
+
+    routeSel.innerHTML = '<option value="" disabled hidden selected>-- Select Route --</option>';
+    for (const { value, label } of routes) {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = label;
+      routeSel.appendChild(opt);
+    }
+    routeSel.disabled = false;
+    routeSel.onchange = () => {
+      routeSel.classList.toggle('has-value', !!routeSel.value);
+      btn.disabled = !routeSel.value;
+    };
+  }
+
+  async function runDistrictRouteMode() {
+    if (document.getElementById('reportSelect').value === 'highway_sequence')    { await hsl_runDistrictRouteMode();  return; }
+    if (document.getElementById('reportSelect').value === 'Ramp_Summary')        { await rs_runDistrictRouteMode();   return; }
+    if (document.getElementById('reportSelect').value === 'highway_log')         { await hl_runDistrictRouteMode();   return; }
+    if (document.getElementById('reportSelect').value === 'intersection_detail') { await intd_runDistrictRouteMode(); return; }
+    if (document.getElementById('reportSelect').value === 'intersection_summary'){ await ints_runDistrictRouteMode(); return; }
+    if (!tokenIsValid()) { login(); return; }
+
+    const district = document.getElementById('districtSelect').value || null; // null = ALL
+    const routeNum = document.getElementById('districtRouteSelect').value;
+    const county   = getDistrictCounty();
+    if (!routeNum) { showRampResults('error', 'Please select a route.');    return; }
+
+    const paddedRoute    = String(routeNum).padStart(3, '0');
+    const isSupplemental = /[A-Z]$/.test(paddedRoute);
+    const routeSuffix    = isSupplemental ? paddedRoute.slice(-1) : '.';
+    const primaryId      = isSupplemental ? `SHS_${paddedRoute}_P`  : `SHS_${paddedRoute}._P`;
+    const secondaryId    = isSupplemental ? `SHS_${paddedRoute}_S`  : `SHS_${paddedRoute}._S`;
+
+    // Always include both alignments — layer 116 may not list all RouteIDs present in layer 132/123
+    // Use -0.001 lower bound to capture records with ARMeasure slightly below 0 due to float precision
+    const segments = [
+      { fromBest: { routeId: primaryId,   measure: -0.001 }, toBest: { routeId: primaryId,   measure: 999.999 } },
+      { fromBest: { routeId: secondaryId, measure: -0.001 }, toBest: { routeId: secondaryId, measure: 999.999 } }
+    ];
+
+    const btn = document.getElementById('districtRouteBtn');
+    btn.disabled = true;
+    startThinking(btn);
+    clearResults();
+
+    try {
+      const [rampPairs, direction] = await Promise.all([
+        queryAttributeSet(segments, district, county),
+        queryRouteDirection(routeNum)
+      ]);
+      _routeLabel    = paddedRoute;
+      _directionFrom = direction.from;
+      _directionTo   = direction.to;
+      const allPairs = sortWithIndependentAlignments(rampPairs);
+      if (allPairs.length === 0) { showRampResults('none'); return; }
+      await queryRampDescriptions(allPairs);
+    } catch (err) {
+      showRampResults('error', err.message || 'An error occurred.');
+    } finally {
+      btn.disabled = false;
+      stopThinking(btn);
+    }
+  }
+
+  async function loadVersions() {
+    const vmsUrl = CONFIG.vmsUrl;
+    const sel = document.getElementById('versionSelect');
+
+    let resp, data;
+    try {
+      resp = await fetch(`${vmsUrl}/versionInfos`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body:    new URLSearchParams({ f: 'json', token: _token }).toString()
+      });
+      data = await resp.json();
+    } catch (e) {
+      console.error('[loadVersions] error:', e.message);
+      return;
+    }
+
+    if (!Array.isArray(data.versions)) {
+      console.warn('[loadVersions] unexpected response:', data);
+      return;
+    }
+
+    // Sort: DEFAULT first, then alphabetically
+    const sorted = [...data.versions].sort((a, b) => {
+      const aDefault = a.versionName.toUpperCase() === 'SDE.DEFAULT';
+      const bDefault = b.versionName.toUpperCase() === 'SDE.DEFAULT';
+      if (aDefault) return -1;
+      if (bDefault) return  1;
+      return a.versionName.localeCompare(b.versionName);
+    });
+
+    sel.innerHTML = '';
+    for (const v of sorted) {
+      const opt = document.createElement('option');
+      const isDefault = v.versionName.toUpperCase() === 'SDE.DEFAULT';
+      opt.value       = isDefault ? '' : v.versionName;
+      opt.textContent = isDefault ? 'Default' : v.versionName;
+      sel.appendChild(opt);
+    }
+  }
+
+  function getVersion() {
+    return document.getElementById('versionSelect').value;
+  }
+
+  // Returns { gdbVersion: '...' } for named versions, or {} for Default (omit parameter)
+  function versionParam() {
+    const v = getVersion();
+    return v ? { gdbVersion: v } : {};
+  }
+
+  function historicMomentParam() {
+    const val = document.getElementById('refDate')?.value; // "YYYY-MM-DD"
+    if (!val || !/^\d{4}-\d{2}-\d{2}$/.test(val)) return {};
+    return { historicMoment: new Date(val).getTime() };
+  }
+
+  function parseHashParams(hash) {
+    return Object.fromEntries(new URLSearchParams(hash.replace(/^#/, '')));
+  }
+
+  function initAuth() {
+    if (window.location.hash) {
+      const hp = parseHashParams(window.location.hash);
+      if (hp.access_token) {
+        _token = hp.access_token;
+        if (hp.expires_in) _tokenExpiry = Date.now() + parseInt(hp.expires_in, 10) * 1000;
+        if (hp.username) _portalUsername = hp.username;
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+        setAuthUI(true);
+        return;
+      }
+    }
+    login();
+  }
+
+  // ── Input population & validation ─────────────────────────────────────────
+
+  function populateCounties() {
+    const sel = document.getElementById('from-county');
+    const placeholder = document.createElement('option');
+    placeholder.value       = '';
+    placeholder.textContent = '-- Select County --';
+    placeholder.disabled    = true;
+    placeholder.hidden      = true;
+    placeholder.selected    = true;
+    sel.appendChild(placeholder);
+    COUNTY_CODES.forEach(({value, display}) => {
+      const opt = document.createElement('option');
+      opt.value       = value;
+      opt.textContent = display;
+      sel.appendChild(opt);
+    });
+  }
+
+  async function populateToCountySelect(routeNum, routeSuffix) {
+    const toCountySel = document.getElementById('to-county');
+    toCountySel.innerHTML = '<option value="" disabled hidden selected>-- Loading... --</option>';
+    toCountySel.disabled = true;
+    checkTranslateReady();
+
+    const paddedRoute = routeNum.padStart(3, '0');
+    const sfxChar = routeSuffix === '.' ? '' : routeSuffix;
+    const params = new URLSearchParams({
+      where:                `RouteID LIKE 'SHS_${paddedRoute}${sfxChar}%'`,
+      outFields:            'County_Code',
+      returnDistinctValues: 'true',
+      returnGeometry:       'false',
+      orderByFields:        'County_Code ASC',
+      ...versionParam(),
+      f:                    'json',
+      token:                _token
+    });
+    let data;
+    try {
+      const resp = await fetch(`${CONFIG.featureServiceUrl}/85/query?${params}`);
+      data = await resp.json();
+    } catch (e) {
+      toCountySel.innerHTML = '<option value="" disabled hidden selected>-- Error loading counties --</option>';
+      return;
+    }
+    if (data.error) {
+      const code = data.error.code;
+      if (code === 498 || code === 499) { _token = null; login(); return; }
+      toCountySel.innerHTML = '<option value="" disabled hidden selected>-- Error loading counties --</option>';
+      return;
+    }
+    if (!Array.isArray(data.features) || data.features.length === 0) {
+      toCountySel.innerHTML = '<option value="" disabled hidden selected>-- No counties found --</option>';
+      return;
+    }
+
+    const seen = new Set();
+    for (const f of data.features) {
+      const code = f.attributes?.County_Code;
+      if (code) seen.add(code);
+    }
+    const matches = COUNTY_CODES.filter(c => seen.has(c.value.replace(/\.$/, '')));
+
+    toCountySel.innerHTML = '';
+    if (matches.length === 0) {
+      toCountySel.innerHTML = '<option value="" disabled hidden selected>-- No counties found --</option>';
+      return;
+    }
+    if (matches.length > 1) {
+      const ph = document.createElement('option');
+      ph.value = ''; ph.textContent = '-- Select County --'; ph.disabled = true; ph.hidden = true; ph.selected = true;
+      toCountySel.appendChild(ph);
+    }
+    for (const { value, display } of matches) {
+      const opt = document.createElement('option');
+      opt.value = value; opt.textContent = display;
+      toCountySel.appendChild(opt);
+    }
+    toCountySel.disabled = false;
+    if (matches.length === 1) {
+      toCountySel.value = matches[0].value;
+      toCountySel.classList.add('has-value');
+    }
+    checkTranslateReady();
+  }
+
+  async function populateRouteSelect(countyCode, selId) {
+    const routeSel = document.getElementById(selId);
+    routeSel.innerHTML = '<option value="" disabled hidden selected>-- Loading... --</option>';
+    routeSel.disabled = true;
+    checkTranslateReady();
+
+    const layer85Code  = countyCode.replace(/\.$/, '');
+    const countyFilter = layer85Code ? ` AND County_Code = '${layer85Code.replace(/'/g, "''")}'` : '';
+    const params = new URLSearchParams({
+      where:                `RouteID LIKE 'SHS%'${countyFilter}`,
+      outFields:            'RouteID',
+      returnDistinctValues: 'true',
+      returnGeometry:       'false',
+      orderByFields:        'RouteID ASC',
+      ...versionParam(),
+      f:                    'json',
+      token:                _token
+    });
+    let data;
+    try {
+      const resp = await fetch(`${CONFIG.featureServiceUrl}/85/query?${params}`);
+      data = await resp.json();
+    } catch (e) {
+      routeSel.innerHTML = '<option value="" disabled hidden selected>-- Error loading routes --</option>';
+      return;
+    }
+    if (data.error) {
+      const code = data.error.code;
+      if (code === 498 || code === 499) { _token = null; login(); return; }
+      routeSel.innerHTML = '<option value="" disabled hidden selected>-- Error loading routes --</option>';
+      return;
+    }
+    if (!Array.isArray(data.features) || data.features.length === 0) {
+      routeSel.innerHTML = '<option value="" disabled hidden selected>-- No routes found --</option>';
+      return;
+    }
+
+    const seen = new Set();
+    const routes = [];
+    for (const f of data.features) {
+      const rid = f.attributes?.RouteID;
+      if (!rid) continue;
+      const m = rid.match(/^SHS_(\d+)([A-Z.]?)_P$/);
+      if (!m) continue;
+      const numStr = m[1];
+      const sfx    = m[2];
+      const hasSfx = sfx && sfx !== '.';
+      const value  = hasSfx ? numStr + sfx : numStr;
+      const num    = parseInt(numStr, 10);
+      if (!seen.has(value)) { seen.add(value); routes.push({ value, num }); }
+    }
+    routes.sort((a, b) => a.num - b.num || a.value.localeCompare(b.value));
+
+    routeSel.innerHTML = '<option value="" disabled hidden selected>-- Select Route --</option>';
+    for (const { value } of routes) {
+      const opt = document.createElement('option');
+      opt.value = value;
+      opt.textContent = value;
+      routeSel.appendChild(opt);
+    }
+    routeSel.disabled = false;
+    checkTranslateReady();
+  }
+
+  async function populatePmPrefixSelect(county, routeNum, routeSuffix) {
+    const pfxSel = document.getElementById('from-pmPrefix');
+    const sfxSel = document.getElementById('from-pmSuffix');
+    pfxSel.innerHTML = '<option value="" disabled hidden selected>-- Loading... --</option>';
+    pfxSel.disabled  = true;
+    sfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select Prefix First --</option>';
+    sfxSel.disabled  = true;
+    checkTranslateReady();
+
+    const routePrefix = county + routeNum.padStart(3, '0') + routeSuffix;
+    const params = new URLSearchParams({
+      where:          `RouteId LIKE '${routePrefix.replace(/'/g, "''")}%'`,
+      outFields:      'RouteId',
+      returnGeometry: 'false',
+      ...versionParam(),
+      f:              'json',
+      token:          _token
+    });
+    let data;
+    try {
+      const resp = await fetch(`${CONFIG.mapServiceUrl}/3/query?${params}`);
+      data = await resp.json();
+    } catch (e) {
+      pfxSel.innerHTML = '<option value="" disabled hidden selected>-- Error loading prefixes --</option>';
+      return;
+    }
+    if (data.error) {
+      const code = data.error.code;
+      if (code === 498 || code === 499) { _token = null; login(); return; }
+      pfxSel.innerHTML = '<option value="" disabled hidden selected>-- Error loading prefixes --</option>';
+      return;
+    }
+    if (!Array.isArray(data.features) || data.features.length === 0) {
+      pfxSel.innerHTML = '<option value="" disabled hidden selected>-- No prefixes found --</option>';
+      return;
+    }
+
+    const pfxOffset = routePrefix.length;
+    const seen = new Set();
+    for (const f of data.features) {
+      const rid = f.attributes?.RouteId;
+      if (!rid || rid.length <= pfxOffset) continue;
+      seen.add(rid[pfxOffset]);
+    }
+    const ORDER = ['.', 'C', 'D', 'G', 'H', 'L', 'M', 'N', 'R', 'S', 'T'];
+    const pfxList = ORDER.filter(p => seen.has(p));
+
+    pfxSel.innerHTML = '';
+    if (pfxList.length === 0) {
+      pfxSel.innerHTML = '<option value="" disabled hidden selected>-- No prefixes found --</option>';
+      return;
+    }
+    if (pfxList.length > 1) {
+      const ph = document.createElement('option');
+      ph.value = ''; ph.textContent = '-- Select Prefix --'; ph.disabled = true; ph.hidden = true; ph.selected = true;
+      pfxSel.appendChild(ph);
+    }
+    for (const p of pfxList) {
+      const opt = document.createElement('option');
+      opt.value = p; opt.textContent = p;
+      pfxSel.appendChild(opt);
+    }
+    pfxSel.disabled = false;
+    if (pfxList.length === 1) {
+      pfxSel.value = pfxList[0];
+      await populatePmSuffixSelect(county, routeNum, routeSuffix, pfxList[0]);
+    }
+    checkTranslateReady();
+  }
+
+  async function populatePmSuffixSelect(county, routeNum, routeSuffix, pmPrefix) {
+    const sfxSel = document.getElementById('from-pmSuffix');
+    sfxSel.innerHTML = '<option value="" disabled hidden selected>-- Loading... --</option>';
+    sfxSel.disabled  = true;
+    checkTranslateReady();
+
+    const routePrefix = county + routeNum.padStart(3, '0') + routeSuffix + pmPrefix;
+    const params = new URLSearchParams({
+      where:          `RouteId LIKE '${routePrefix.replace(/'/g, "''")}%'`,
+      outFields:      'PMSuffix',
+      returnGeometry: 'false',
+      ...versionParam(),
+      f:              'json',
+      token:          _token
+    });
+    let data;
+    try {
+      const resp = await fetch(`${CONFIG.mapServiceUrl}/3/query?${params}`);
+      data = await resp.json();
+    } catch (e) {
+      sfxSel.innerHTML = '<option value="" disabled hidden selected>-- Error loading suffixes --</option>';
+      return;
+    }
+    if (data.error) {
+      const code = data.error.code;
+      if (code === 498 || code === 499) { _token = null; login(); return; }
+      sfxSel.innerHTML = '<option value="" disabled hidden selected>-- Error loading suffixes --</option>';
+      return;
+    }
+    if (!Array.isArray(data.features) || data.features.length === 0) {
+      sfxSel.innerHTML = '<option value="" disabled hidden selected>-- No suffixes found --</option>';
+      return;
+    }
+
+    const seen = new Set();
+    for (const f of data.features) {
+      const sfx = f.attributes?.PMSuffix;
+      seen.add(sfx && sfx !== '' ? sfx : '.');
+    }
+    const ORDER = ['.', 'R', 'L'];
+    const sfxList = ORDER.filter(s => seen.has(s));
+
+    sfxSel.innerHTML = '';
+    if (sfxList.length === 0) {
+      sfxSel.innerHTML = '<option value="" disabled hidden selected>-- No suffixes found --</option>';
+      return;
+    }
+    if (sfxList.length > 1) {
+      const ph = document.createElement('option');
+      ph.value = ''; ph.textContent = '-- Select Suffix --'; ph.disabled = true; ph.hidden = true; ph.selected = true;
+      sfxSel.appendChild(ph);
+    }
+    for (const s of sfxList) {
+      const opt = document.createElement('option');
+      opt.value = s; opt.textContent = s;
+      sfxSel.appendChild(opt);
+    }
+    sfxSel.disabled = false;
+    if (sfxList.length === 1) sfxSel.value = sfxList[0];
+    checkTranslateReady();
+  }
+
+  function onFromPmPrefixChange() {
+    const county    = document.getElementById('from-county').value;
+    const routeRaw  = document.getElementById('from-routeNum').value;
+    const sfxMatch  = routeRaw.match(/^(\d+)([A-Z])$/);
+    const routeNum  = sfxMatch ? sfxMatch[1] : routeRaw;
+    const routeSuffix = sfxMatch ? sfxMatch[2] : '.';
+    const pmPrefix  = document.getElementById('from-pmPrefix').value;
+    populatePmSuffixSelect(county, routeNum, routeSuffix, pmPrefix);
+  }
+
+  async function populateToPmPrefixSelect(county, routeNum, routeSuffix) {
+    const pfxSel = document.getElementById('to-pmPrefix');
+    const sfxSel = document.getElementById('to-pmSuffix');
+    pfxSel.innerHTML = '<option value="" disabled hidden selected>-- Loading... --</option>';
+    pfxSel.disabled  = true;
+    sfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select Prefix First --</option>';
+    sfxSel.disabled  = true;
+    checkTranslateReady();
+
+    const routePrefix = county + routeNum.padStart(3, '0') + routeSuffix;
+    const params = new URLSearchParams({
+      where:          `RouteId LIKE '${routePrefix.replace(/'/g, "''")}%'`,
+      outFields:      'RouteId',
+      returnGeometry: 'false',
+      ...versionParam(),
+      f:              'json',
+      token:          _token
+    });
+    let data;
+    try {
+      const resp = await fetch(`${CONFIG.mapServiceUrl}/3/query?${params}`);
+      data = await resp.json();
+    } catch (e) {
+      pfxSel.innerHTML = '<option value="" disabled hidden selected>-- Error loading prefixes --</option>';
+      return;
+    }
+    if (data.error) {
+      const code = data.error.code;
+      if (code === 498 || code === 499) { _token = null; login(); return; }
+      pfxSel.innerHTML = '<option value="" disabled hidden selected>-- Error loading prefixes --</option>';
+      return;
+    }
+    if (!Array.isArray(data.features) || data.features.length === 0) {
+      pfxSel.innerHTML = '<option value="" disabled hidden selected>-- No prefixes found --</option>';
+      return;
+    }
+
+    const pfxOffset = routePrefix.length;
+    const seen = new Set();
+    for (const f of data.features) {
+      const rid = f.attributes?.RouteId;
+      if (!rid || rid.length <= pfxOffset) continue;
+      seen.add(rid[pfxOffset]);
+    }
+    const ORDER = ['.', 'C', 'D', 'G', 'H', 'L', 'M', 'N', 'R', 'S', 'T'];
+    const pfxList = ORDER.filter(p => seen.has(p));
+
+    pfxSel.innerHTML = '';
+    if (pfxList.length === 0) {
+      pfxSel.innerHTML = '<option value="" disabled hidden selected>-- No prefixes found --</option>';
+      return;
+    }
+    if (pfxList.length > 1) {
+      const ph = document.createElement('option');
+      ph.value = ''; ph.textContent = '-- Select Prefix --'; ph.disabled = true; ph.hidden = true; ph.selected = true;
+      pfxSel.appendChild(ph);
+    }
+    for (const p of pfxList) {
+      const opt = document.createElement('option');
+      opt.value = p; opt.textContent = p;
+      pfxSel.appendChild(opt);
+    }
+    pfxSel.disabled = false;
+    if (pfxList.length === 1) {
+      pfxSel.value = pfxList[0];
+      await populateToPmSuffixSelect(county, routeNum, routeSuffix, pfxList[0]);
+    }
+    checkTranslateReady();
+  }
+
+  async function populateToPmSuffixSelect(county, routeNum, routeSuffix, pmPrefix) {
+    const sfxSel = document.getElementById('to-pmSuffix');
+    sfxSel.innerHTML = '<option value="" disabled hidden selected>-- Loading... --</option>';
+    sfxSel.disabled  = true;
+    checkTranslateReady();
+
+    const routePrefix = county + routeNum.padStart(3, '0') + routeSuffix + pmPrefix;
+    const params = new URLSearchParams({
+      where:          `RouteId LIKE '${routePrefix.replace(/'/g, "''")}%'`,
+      outFields:      'PMSuffix',
+      returnGeometry: 'false',
+      ...versionParam(),
+      f:              'json',
+      token:          _token
+    });
+    let data;
+    try {
+      const resp = await fetch(`${CONFIG.mapServiceUrl}/3/query?${params}`);
+      data = await resp.json();
+    } catch (e) {
+      sfxSel.innerHTML = '<option value="" disabled hidden selected>-- Error loading suffixes --</option>';
+      return;
+    }
+    if (data.error) {
+      const code = data.error.code;
+      if (code === 498 || code === 499) { _token = null; login(); return; }
+      sfxSel.innerHTML = '<option value="" disabled hidden selected>-- Error loading suffixes --</option>';
+      return;
+    }
+    if (!Array.isArray(data.features) || data.features.length === 0) {
+      sfxSel.innerHTML = '<option value="" disabled hidden selected>-- No suffixes found --</option>';
+      return;
+    }
+
+    const seen = new Set();
+    for (const f of data.features) {
+      const sfx = f.attributes?.PMSuffix;
+      seen.add(sfx && sfx !== '' ? sfx : '.');
+    }
+    const ORDER = ['.', 'R', 'L'];
+    const sfxList = ORDER.filter(s => seen.has(s));
+
+    sfxSel.innerHTML = '';
+    if (sfxList.length === 0) {
+      sfxSel.innerHTML = '<option value="" disabled hidden selected>-- No suffixes found --</option>';
+      return;
+    }
+    if (sfxList.length > 1) {
+      const ph = document.createElement('option');
+      ph.value = ''; ph.textContent = '-- Select Suffix --'; ph.disabled = true; ph.hidden = true; ph.selected = true;
+      sfxSel.appendChild(ph);
+    }
+    for (const s of sfxList) {
+      const opt = document.createElement('option');
+      opt.value = s; opt.textContent = s;
+      sfxSel.appendChild(opt);
+    }
+    sfxSel.disabled = false;
+    if (sfxList.length === 1) sfxSel.value = sfxList[0];
+    checkTranslateReady();
+  }
+
+  function onToPmPrefixChange() {
+    const county    = document.getElementById('to-county').value;
+    const routeRaw  = document.getElementById('to-routeNum').value;
+    const sfxMatch  = routeRaw.match(/^(\d+)([A-Z])$/);
+    const routeNum  = sfxMatch ? sfxMatch[1] : routeRaw;
+    const routeSuffix = sfxMatch ? sfxMatch[2] : '.';
+    const pmPrefix  = document.getElementById('to-pmPrefix').value;
+    populateToPmSuffixSelect(county, routeNum, routeSuffix, pmPrefix);
+  }
+
+  function onFromCountyChange() {
+    const sel = document.getElementById('from-county');
+    sel.classList.toggle('has-value', !!sel.value);
+    const routeSel = document.getElementById('from-routeNum');
+    routeSel.innerHTML = '<option value="" disabled hidden selected>-- Select Route --</option>';
+    routeSel.disabled = true;
+    const toRouteSel = document.getElementById('to-routeNum');
+    toRouteSel.innerHTML = '<option value="" disabled hidden selected>-- Select Route --</option>';
+    const toCountySel = document.getElementById('to-county');
+    toCountySel.innerHTML = '<option value="" disabled hidden selected>-- Select Route First --</option>';
+    toCountySel.disabled = true;
+    toCountySel.classList.remove('has-value');
+    const toPfxSel = document.getElementById('to-pmPrefix');
+    toPfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select County First --</option>';
+    toPfxSel.disabled = true;
+    const toSfxSel = document.getElementById('to-pmSuffix');
+    toSfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select Prefix First --</option>';
+    toSfxSel.disabled = true;
+    const pfxSel = document.getElementById('from-pmPrefix');
+    pfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select Route First --</option>';
+    pfxSel.disabled = true;
+    const sfxSel = document.getElementById('from-pmSuffix');
+    sfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select Prefix First --</option>';
+    sfxSel.disabled = true;
+    checkTranslateReady();
+    if (!sel.value) return;
+    populateRouteSelect(sel.value, 'from-routeNum');
+  }
+
+  function onFromRouteChange() {
+    const fromRoute = document.getElementById('from-routeNum').value;
+    const toRouteSel = document.getElementById('to-routeNum');
+    toRouteSel.innerHTML = '';
+    const opt = document.createElement('option');
+    opt.value = fromRoute; opt.textContent = fromRoute; opt.selected = true;
+    toRouteSel.appendChild(opt);
+    const toCountySel = document.getElementById('to-county');
+    toCountySel.innerHTML = '<option value="" disabled hidden selected>-- Select Route First --</option>';
+    toCountySel.disabled = true;
+    toCountySel.classList.remove('has-value');
+    const toPfxSel = document.getElementById('to-pmPrefix');
+    toPfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select County First --</option>';
+    toPfxSel.disabled = true;
+    const toSfxSel = document.getElementById('to-pmSuffix');
+    toSfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select Prefix First --</option>';
+    toSfxSel.disabled = true;
+    const pfxSel = document.getElementById('from-pmPrefix');
+    pfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select Route First --</option>';
+    pfxSel.disabled = true;
+    const sfxSel = document.getElementById('from-pmSuffix');
+    sfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select Prefix First --</option>';
+    sfxSel.disabled = true;
+    checkTranslateReady();
+    const county      = document.getElementById('from-county').value;
+    const sfxMatch    = fromRoute.match(/^(\d+)([A-Z])$/);
+    const routeNum    = sfxMatch ? sfxMatch[1] : fromRoute;
+    const routeSuffix = sfxMatch ? sfxMatch[2] : '.';
+    populatePmPrefixSelect(county, routeNum, routeSuffix);
+    populateToCountySelect(routeNum, routeSuffix);
+  }
+
+  function onToCountyChange() {
+    const sel = document.getElementById('to-county');
+    sel.classList.toggle('has-value', !!sel.value);
+    const pfxSel = document.getElementById('to-pmPrefix');
+    pfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select County First --</option>';
+    pfxSel.disabled = true;
+    const sfxSel = document.getElementById('to-pmSuffix');
+    sfxSel.innerHTML = '<option value="" disabled hidden selected>-- Select Prefix First --</option>';
+    sfxSel.disabled = true;
+    checkTranslateReady();
+    if (!sel.value) return;
+    const routeRaw    = document.getElementById('to-routeNum').value;
+    const sfxMatch    = routeRaw.match(/^(\d+)([A-Z])$/);
+    const routeNum    = sfxMatch ? sfxMatch[1] : routeRaw;
+    const routeSuffix = sfxMatch ? sfxMatch[2] : '.';
+    populateToPmPrefixSelect(sel.value, routeNum, routeSuffix);
+  }
+
+  function setupValidation() {
+    ['from-measure', 'to-measure'].forEach(id => {
+      const el = document.getElementById(id);
+      el.addEventListener('input', () => {
+        let v = el.value.replace(/[^0-9.]/g, '');
+        const dotIdx = v.indexOf('.');
+        if (dotIdx !== -1) {
+          v = v.slice(0, dotIdx + 1) + v.slice(dotIdx + 1).replace(/\./g, '');
+          if (v.length > dotIdx + 4) v = v.slice(0, dotIdx + 4);
+        }
+        el.value = v;
+      });
+    });
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  function readSection(prefix) {
+    const routeRaw = document.getElementById(`${prefix}-routeNum`).value;
+    const sfxMatch = routeRaw.match(/^(\d+)([A-Z])$/);
+    return {
+      county:      document.getElementById(`${prefix}-county`).value,
+      routeNum:    sfxMatch ? sfxMatch[1] : routeRaw,
+      routeSuffix: sfxMatch ? sfxMatch[2] : '.',
+      pmPrefix:    document.getElementById(`${prefix}-pmPrefix`).value,
+      pmSuffix:    document.getElementById(`${prefix}-pmSuffix`).value,
+      measureRaw:  document.getElementById(`${prefix}-measure`).value.trim(),
+    };
+  }
+
+  function buildRouteId(s, alignment) {
+    return s.county + s.routeNum.padStart(3, '0') + s.routeSuffix + s.pmPrefix + s.pmSuffix + alignment;
+  }
+
+  // Sort pairs by odMeasure, grouping independent alignment sections (PMSuffix R
+  // or L) so all R records in a section appear before all L records.
+  // Equation first-rows (isSecondEq=false, "EQUATES TO") are removed from the
+  // sort to prevent them from breaking R/L groups, then re-inserted immediately
+  // before their eq2 partner based on eqPairId.
+  function sortWithIndependentAlignments(pairs) {
+    const eq1ById = new Map();
+    const main = pairs.filter(p => {
+      if (p.type === 'equation' && !p.isSecondEq) { eq1ById.set(p.eqPairId, p); return false; }
+      return true;
+    });
+
+    // Build a map: Route Break AR → its paired Route Resume, for tiebreak use.
+    // Pair each Route Break with the nearest Route Resume at a higher AR.
+    const rbBreaks  = main.filter(p => p.type === 'routebreak' && p.desc === 'Route Break');
+    const rbResumes = main.filter(p => p.type === 'routebreak' && p.desc === 'Route Resume');
+    const rbResumeForBreak = new Map(); // break.name → resume pair
+    for (const brk of rbBreaks) {
+      const brkAr = brk.arMeasure ?? Infinity;
+      const paired = rbResumes
+        .filter(r => (r.arMeasure ?? Infinity) >= brkAr)
+        .sort((x, y) => (x.arMeasure ?? Infinity) - (y.arMeasure ?? Infinity))[0];
+      if (paired) rbResumeForBreak.set(brk.name, paired);
+    }
+    // Build reverse map: resume.name → its Route Break
+    const rbBreakForResume = new Map();
+    for (const [brkName, resume] of rbResumeForBreak) {
+      rbBreakForResume.set(resume.name, main.find(p => p.name === brkName));
+    }
+
+    // ── Alignment-start AR fixup ─────────────────────────────────────────────
+    // Equation points marking the START of an R/L alignment (non-empty pmPrefix,
+    // pmMeasure ≈ 0) get their arMeasure from the PM-network calibration
+    // translation. That value can differ slightly from the AllRoads AR of the
+    // first alignment records sharing the same pmPrefix — either slightly below
+    // (original case) or slightly above (e.g. an sfx:L landmark that translates
+    // lower than eq2's calibration AR). In either case, the outer grouping loop
+    // can reach an R/L record before eq2 in main[], start a section prematurely,
+    // and leave that record in the wrong alignment group or above the eq pair.
+    //
+    // Fix: clamp eq2.arMeasure down to just below the minimum AR of non-boundary
+    // records sharing its pmPrefix (Math.min handles both over- and under-shoot).
+    // The equation-type tiebreak then guarantees eq2 sorts first within the shared
+    // 3dp bucket, so the outer loop pushes eq2 (via the else branch) before any
+    // alignment record triggers a new section.
+    for (const p of main) {
+      if (p.type !== 'equation' || !p.isSecondEq) continue;
+      const pfx = p.pmPrefix;
+      if (!pfx || pfx === '') continue;                  // only non-empty prefixes
+      if (parseFloat(p.pmMeasure) >= 0.01) continue;    // only pm ≈ 0 (alignment start)
+      let minPfxAr = Infinity;
+      for (const r of main) {
+        if (r === p || r.pmPrefix !== pfx) continue;
+        if (r.arMeasure == null || isNaN(r.arMeasure)) continue;
+        if (r.type === 'landmark' && (               // skip IA boundary landmarks
+          r.desc === 'BEGIN LEFT INDEPENDENT ALIGNMENT'  || r.desc === 'END LEFT INDEPENDENT ALIGNMENT'  ||
+          r.desc === 'BEGIN RIGHT INDEPENDENT ALIGNMENT' || r.desc === 'END RIGHT INDEPENDENT ALIGNMENT'
+        )) continue;
+        minPfxAr = Math.min(minPfxAr, r.arMeasure);
+      }
+      if (minPfxAr < Infinity) {
+        p.arMeasure = Math.min(p.arMeasure, minPfxAr - 0.0005);
+      }
+    }
+
+    main.sort((a, b) => {
+      const aAr = a.arMeasure;
+      const bAr = b.arMeasure;
+      // Treat missing AR as Infinity so null/NaN records don't break comparator
+      // consistency (which corrupts TimSort for all nearby records).
+      // Round to 3 decimal places before comparing so that two AR values that
+      // agree to 3dp (e.g. 239.2454 vs 239.2466) are treated as co-located and
+      // fall through to the tiebreak rules below rather than sorting by raw AR.
+      const aVal = (aAr == null || isNaN(aAr)) ? Infinity : Math.round(aAr * 1000) / 1000;
+      const bVal = (bAr == null || isNaN(bAr)) ? Infinity : Math.round(bAr * 1000) / 1000;
+      const diff = aVal - bVal;
+      // City boundary records sort before intersections/ramps at the same PM even
+      // when their stored AR values differ slightly: layer 74's FromARMeasure /
+      // ToARMeasure may not exactly equal the AR produced by translating the
+      // intersection's PM position, so the diff===0 pmKey tiebreak below never fires.
+      // Only applies when the PM key matches; otherwise fall through to normal AR sort.
+      if (diff !== 0) {
+        const isCityBoundary = t => t === 'citybegin' || t === 'cityend';
+        const isIorR         = t => t === 'intersection' || t === 'ramp';
+        if ((isCityBoundary(a.type) && isIorR(b.type)) || (isCityBoundary(b.type) && isIorR(a.type))) {
+          const normKey = p => `${p.pmPrefix === '.' ? '' : (p.pmPrefix ?? '')}|${isNaN(parseFloat(p.pmMeasure)) ? p.pmMeasure : parseFloat(p.pmMeasure).toFixed(3)}|${p.pmSuffix}`;
+          const nkA = normKey(a), nkB = normKey(b);
+          if (nkA === nkB) return isCityBoundary(a.type) ? -1 : 1;
+        }
+        return diff;
+      }
+      // Two route break records at the same OD: Route Break before Route Resume.
+      if (a.type === 'routebreak' && b.type === 'routebreak') {
+        if (a.desc === 'Route Break' && b.desc !== 'Route Break') return -1;
+        if (a.desc !== 'Route Break' && b.desc === 'Route Break') return 1;
+      }
+      // E-suffix tiebreak does not apply to equation records — eq2 uses pmSuffix='E'
+      // as a marker but must fall through to the equation tiebreak below.
+      if (a.pmSuffix === 'E' && b.pmSuffix !== 'E' && a.type !== 'equation') return 1;
+      if (a.pmSuffix !== 'E' && b.pmSuffix === 'E' && b.type !== 'equation') return -1;
+      // Equation points sort before all other record types at the same AR position.
+      if (a.type === 'equation' && b.type !== 'equation') return -1;
+      if (a.type !== 'equation' && b.type === 'equation') return 1;
+      // Two equation points at the same 3dp AR: use full precision to differentiate.
+      if (a.type === 'equation' && b.type === 'equation') return (aAr ?? Infinity) - (bAr ?? Infinity);
+      // Same PM combination: H (landmarks/equations/etc.) before I (intersections) before R (ramps).
+      // Within H type, H-valued HG records before non-H (R, L, D, etc.).
+      // Use parseFloat+toFixed(3) for pmMeasure so "020.558" and "20.558" compare equal.
+      // Normalize pmPrefix: '.' and '' are both "no prefix" — city begin/end records get '.'
+      // from the LRServer PM route ID while intersection records get '' from a null PMPrefix field.
+      const normPfx = p => (p.pmPrefix === '.' ? '' : (p.pmPrefix ?? ''));
+      const pmKey = p => `${normPfx(p)}|${isNaN(parseFloat(p.pmMeasure)) ? p.pmMeasure : parseFloat(p.pmMeasure).toFixed(3)}|${p.pmSuffix}`;
+      if (pmKey(a) === pmKey(b)) {
+        const ftOf = p => {
+          if (p.type === 'equation' || p.type === 'landmark' || p.type === 'routebreak' ||
+              p.type === 'citybegin' || p.type === 'cityend') return 0; // H
+          if (p.type === 'intersection') return 1;                       // I
+          return 2;                                                       // R (ramp)
+        };
+        const ftDiff = ftOf(a) - ftOf(b);
+        if (ftDiff !== 0) return ftDiff;
+        const hgRank = p => (!p.hgValue || p.hgValue === 'H') ? 0 : 1;
+        const hgDiff = hgRank(a) - hgRank(b);
+        if (hgDiff !== 0) return hgDiff;
+      }
+      // Route break tiebreak: when a non-routebreak record shares OD with a Route Break or
+      // Route Resume, place it before the pair if PM matches Route Break, after if PM matches Resume.
+      const aIsRb = a.type === 'routebreak';
+      const bIsRb = b.type === 'routebreak';
+      if (aIsRb !== bIsRb) {
+        const rb    = aIsRb ? a : b;
+        const other = aIsRb ? b : a;
+        const otherPm = parseFloat(other.pmMeasure);
+        if (!isNaN(otherPm)) {
+          // Find the break/resume pair members regardless of which one we're comparing against
+          const isBreak  = rb.desc === 'Route Break';
+          const isResume = rb.desc === 'Route Resume';
+          const brk    = isBreak  ? rb : rbBreakForResume.get(rb.name);
+          const resume = isResume ? rb : rbResumeForBreak.get(rb.name);
+          const brkPm    = brk    ? parseFloat(brk.pmMeasure)    : NaN;
+          const resumePm = resume ? parseFloat(resume.pmMeasure) : NaN;
+          if (!isNaN(brkPm) && Math.abs(otherPm - brkPm) < 0.001) {
+            // PM matches Route Break → other goes before the pair
+            return aIsRb ? 1 : -1;
+          }
+          if (!isNaN(resumePm) && Math.abs(otherPm - resumePm) < 0.001) {
+            // PM matches Route Resume → other goes after the pair
+            return aIsRb ? -1 : 1;
+          }
+        }
+      }
+      // Equation point tiebreak: when a non-equation record shares OD with an eq2 record,
+      // place it before the pair if its PM matches eq1 (source measure),
+      // or after the pair if its PM matches eq2 (the "EQUATES TO" measure).
+      const aIsEq2 = a.type === 'equation' && a.isSecondEq;
+      const bIsEq2 = b.type === 'equation' && b.isSecondEq;
+      if (aIsEq2 !== bIsEq2) {
+        const eq2   = aIsEq2 ? a : b;
+        const other = aIsEq2 ? b : a;
+        const eq1   = eq1ById.get(eq2.eqPairId);
+        if (eq1) {
+          const otherPm = parseFloat(other.pmMeasure);
+          const eq1Pm   = parseFloat(eq1.pmMeasure);
+          const eq2Pm   = parseFloat(eq2.pmMeasure);
+          if (!isNaN(otherPm)) {
+            if (!isNaN(eq1Pm) && Math.abs(otherPm - eq1Pm) < 0.001) {
+              // other PM matches eq1 (source) → other goes before the pair
+              return aIsEq2 ? 1 : -1;
+            }
+            if (!isNaN(eq2Pm) && Math.abs(otherPm - eq2Pm) < 0.001) {
+              // other PM matches eq2 → other goes after the pair
+              return aIsEq2 ? -1 : 1;
+            }
+          }
+        }
+      }
+      // County-end vs landmark at the same AR:
+      //   Same county   → landmark is a physical location in the ending county and sorts first
+      //                   (e.g. TRONA RD at the SBD/INY line belongs to SBD before the county-end).
+      //   Diff county   → landmark is a county-line marker for the incoming county (e.g. "BEGIN OF
+      //                   COUNTY" stored as COL/0.000 at the LAK/COL line) and sorts after the county-end.
+      if (a.type === 'countyend' && b.type === 'landmark') return a.county === b.county ? 1 : -1;
+      if (a.type === 'landmark' && b.type === 'countyend') return a.county === b.county ? -1 : 1;
+      // Final tiebreaker: sort by PMMeasure ascending.
+      // Exception: at a county boundary the PM resets (e.g. 24.750 → 0.000 at the same AR).
+      // Detect this when one value is near-zero and the difference is large — in that case
+      // the higher PM belongs to the ending county and must sort first.
+      const aPm = parseFloat(a.pmMeasure);
+      const bPm = parseFloat(b.pmMeasure);
+      if (!isNaN(aPm) && !isNaN(bPm) && aPm !== bPm) {
+        const minPm = Math.min(aPm, bPm);
+        const maxPm = Math.max(aPm, bPm);
+        if (minPm < 0.5 && maxPm - minPm > 5) return bPm - aPm; // county PM reset: larger PM first
+        return aPm - bPm;
+      }
+      return 0;
+    });
+    // Matches any BEGIN/END INDEPENDENT ALIGNMENT landmark regardless of the
+    // exact wording used (data uses many abbreviations: "BEG INDEP ALIGN",
+    // "END INDEP ALIGN LT & RT", "BEGIN INDEP ALIGN - LT", etc.).
+    // Matches BEGIN/END INDEPENDENT ALIGNMENT landmarks regardless of abbreviation:
+    // "INDEP ALIGN", "IND ALIGN" (abbreviated form without the 'EP'), "INDEPENDENT ALIGNMENT".
+    const isIABoundaryRec = p => p.type === 'landmark' && p.desc && /IND.*ALIGN/i.test(p.desc);
+
+    // Records absorbed by a section's tail scan so the outer loop can skip them.
+    const absorbedRecs = new Set();
+    // R/L-suffix IA boundary records (e.g. BEGIN LEFT INDEPENDENT ALIGNMENT) that
+    // appear before their section trigger in sort order. Deferred here and flushed
+    // into the next section's allSec so they land in rGroup/lGroup.
+    const deferredIABounds = [];
+
+    // Single-side INDEP ALIGN records (RT-only or LT-only) where the nearest
+    // preceding record with the matching pmSuffix has a different pmPrefix.
+    // These should not be absorbed into a section group — they belong with neutral
+    // IA boundaries after the section rather than in rGroup/lGroup.
+    const normPfxSort = v => (v === '.' ? '' : (v ?? ''));
+    const indepNoPmPfxMatch = new Set();
+    for (let k = 0; k < main.length; k++) {
+      const p = main[k];
+      if (!isIABoundaryRec(p)) continue;
+      const hasRT = /\bRT\b/i.test(p.desc);
+      const hasLT = /\bLT\b/i.test(p.desc);
+      let targetSuffix = null;
+      if (hasRT && !hasLT) targetSuffix = 'R';
+      else if (hasLT && !hasRT) targetSuffix = 'L';
+      if (!targetSuffix) continue;
+      const prevMatch = main.slice(0, k).reverse().find(r => r.pmSuffix === targetSuffix);
+      if (!prevMatch || normPfxSort(prevMatch.pmPrefix) !== normPfxSort(p.pmPrefix)) {
+        indepNoPmPfxMatch.add(p);
+      }
+    }
+
+    const grouped = [];
+    let i = 0;
+    while (i < main.length) {
+      // Skip records already absorbed into a preceding section's tail scan.
+      if (absorbedRecs.has(main[i])) { i++; continue; }
+      if ((main[i].pmSuffix === 'R' || main[i].pmSuffix === 'L') && !isIABoundaryRec(main[i]) &&
+          main[i].type !== 'countybegin' && main[i].type !== 'countyend' &&
+          main[i].type !== 'citybegin'   && main[i].type !== 'cityend') {
+        const j = i;
+        // County of the trigger record — used to prevent records from a different
+        // county's independent alignment from being bundled into this section.
+        const sectionCounty = main[j].county ?? '';
+        // Continue through R, L, E, and any dot-record whose hgValue is 'R'
+        // or 'L'. pmPrefix is unreliable — some END INDEP ALIGN landmarks
+        // carry pmPrefix='.' rather than 'R', so we use hgValue exclusively.
+        // tailSection collects records absorbed past an eq2 break that belongs
+        // to this same independent alignment span.
+        const tailSection = [];
+        const _iBeforeInner = i;
+        while (i < main.length) {
+          const cur = main[i];
+          // Equation records must not be classified by hgValue — their highway group
+          // reflects the alignment at their calibration-derived AR, not their actual
+          // sort position, and consuming them via hgValue bypasses the sfx:E break
+          // below, reordering the eq pair to land after the section's L group.
+          if (cur.type !== 'equation' && (cur.pmSuffix === 'R' || cur.pmSuffix === 'L' || cur.hgValue === 'R' || cur.hgValue === 'L')) {
+            // Stop if this record belongs to a different county's independent alignment.
+            if (cur.county && sectionCounty && cur.county !== sectionCounty) break;
+            i++;
+          } else if (cur.pmSuffix === 'E') {
+            // Equation records use pmSuffix='E' as a rendering marker, not as an
+            // alignment boundary. Pulling them into a section reorders them out of
+            // AR sequence (E-group lands before trailing dot records). Break so eq2
+            // passes through the outer loop at its natural AR position.
+            //
+            // However, if R/L records remain in this same alignment span beyond the
+            // eq point, absorb them via a tail scan rather than letting them form a
+            // spurious second section that outputs after the eq pair.
+            if (cur.type === 'equation') {
+              // Peek past eq2, IA boundary records, and any neutral dot records that
+              // are co-located with eq2 (same rounded AR). Sorting places eq2 first at
+              // a given AR, pushing co-located R/L records to higher indices; those
+              // records must not block detection of the remaining alignment records.
+              // Dot-suffix IA boundaries seen during the peek (e.g. END INDEP ALIGN - RT)
+              // are collected so they can be absorbed into the section's dotGroup output,
+              // ensuring they appear before the equation pair rather than after it.
+              let peekK = i + 1;
+              const eq2Ar3dp = Math.round(cur.arMeasure * 1000);
+              const peekedIABounds = [];
+              while (peekK < main.length) {
+                const pk = main[peekK];
+                if (pk.type === 'equation') { peekK++; continue; }
+                if (isIABoundaryRec(pk)) {
+                  // Single-side INDEP ALIGN records that fail the PMPrefix test are
+                  // not absorbed — they outer-push naturally after the eq pair,
+                  // alongside other neutral IA boundaries at the same AR.
+                  if (indepNoPmPfxMatch.has(pk)) { peekK++; continue; }
+                  // Collect ALL IA boundary records (both dot-sfx and R/L-sfx) so
+                  // they can be unconditionally absorbed into this section below.
+                  peekedIABounds.push(pk);
+                  peekK++; continue;
+                }
+                if (Math.round(pk.arMeasure * 1000) === eq2Ar3dp &&
+                    pk.pmSuffix !== 'R' && pk.pmSuffix !== 'L' &&
+                    pk.hgValue !== 'R'  && pk.hgValue !== 'L') { peekK++; continue; }
+                break;
+              }
+              const moreRLAhead = peekK < main.length &&
+                (main[peekK].pmSuffix === 'R' || main[peekK].pmSuffix === 'L' ||
+                 main[peekK].hgValue === 'R'  || main[peekK].hgValue === 'L');
+              // Always absorb ALL peeked IA boundaries into this section — they
+              // belong to this alignment span regardless of whether more R/L records
+              // follow (e.g. END RIGHT INDEPENDENT ALIGNMENT after the last ramp).
+              for (const pk of peekedIABounds) { tailSection.push(pk); absorbedRecs.add(pk); }
+              if (moreRLAhead) {
+                // Tail scan: collect remaining alignment records into tailSection.
+                let k = peekK;
+                while (k < main.length) {
+                  const tr = main[k];
+                  if (tr.type === 'equation') { k++; continue; }
+                  if (isIABoundaryRec(tr)) {
+                    // Absorb all IA boundary records into the section.
+                    tailSection.push(tr); absorbedRecs.add(tr);
+                    k++; continue;
+                  }
+                  if (tr.type !== 'equation' && (tr.pmSuffix === 'R' || tr.pmSuffix === 'L' ||
+                      tr.hgValue === 'R' || tr.hgValue === 'L')) {
+                    if (tr.county && sectionCounty && tr.county !== sectionCounty) break;
+                    tailSection.push(tr); absorbedRecs.add(tr); k++;
+                  } else if (tr.pmSuffix === 'E') {
+                    if (tr.type === 'equation') { k++; continue; }
+                    tailSection.push(tr); absorbedRecs.add(tr); k++;
+                    let moreRL2 = false;
+                    for (let m = k; m < main.length; m++) {
+                      const la = main[m];
+                      if (la.type === 'equation' || isIABoundaryRec(la)) continue;
+                      if (la.pmSuffix === 'E') break;
+                      if (la.county && sectionCounty && la.county !== sectionCounty) break;
+                      if (la.pmSuffix === 'R' || la.pmSuffix === 'L' ||
+                          la.hgValue === 'R'  || la.hgValue === 'L') { moreRL2 = true; break; }
+                      break;
+                    }
+                    if (!moreRL2) break;
+                  } else {
+                    // Neutral dot record (sfx and hg are both non-R/L). Check if
+                    // more R/L alignment records follow; if so, skip over this record
+                    // without absorbing (the outer loop will place it after the eq pair).
+                    // If no R/L remain, stop the tail scan.
+                    let moreRL2 = false;
+                    for (let m = k + 1; m < main.length; m++) {
+                      const la = main[m];
+                      if (la.type === 'equation' || isIABoundaryRec(la)) continue;
+                      if (la.pmSuffix === 'E') break;
+                      if (la.county && sectionCounty && la.county !== sectionCounty) break;
+                      if (la.pmSuffix === 'R' || la.pmSuffix === 'L' ||
+                          la.hgValue === 'R'  || la.hgValue === 'L') { moreRL2 = true; break; }
+                      break;
+                    }
+                    if (moreRL2) k++; else break;
+                  }
+                }
+                break; // inner loop: eq2 is still at i, outer loop handles it
+              }
+              break;
+            }
+            i++;
+            // Only continue the section past this equation point if R/L records
+            // follow before the next E. Stopping at the next E prevents a chain
+            // of equation points from extending the section across the whole route.
+            let hasMoreRL = false;
+            for (let k = i; k < main.length; k++) {
+              const la = main[k];
+              if (la.pmSuffix === 'E') break;
+              if (la.county && sectionCounty && la.county !== sectionCounty) break;
+              if (la.pmSuffix === 'R' || la.pmSuffix === 'L' || la.hgValue === 'R' || la.hgValue === 'L') {
+                hasMoreRL = true;
+                break;
+              }
+            }
+            if (!hasMoreRL) break;
+          } else {
+            // Dot-suffix, non-hgValue record — look ahead for more R/L records
+            // before the next E. If found, this record falls between the R and L
+            // sub-sections and belongs in the section's trailing bucket.
+            // Stop immediately if the record is an IA boundary (BEGIN/END INDEP ALIGN)
+            // — these mark the edge of the alignment span, not inter-group filler.
+            if (isIABoundaryRec(cur)) break;
+            // Stop immediately if the record's own county differs from the section's
+            // trigger county — independent alignments do not span county boundaries.
+            if (cur.county && sectionCounty && cur.county !== sectionCounty) break;
+            let hasMoreRL = false;
+            for (let k = i + 1; k < main.length; k++) {
+              const la = main[k];
+              if (la.pmSuffix === 'E') break; // E marks end of current alignment span
+              if (isIABoundaryRec(la)) break; // IA boundary ends this span
+              if (la.county && sectionCounty && la.county !== sectionCounty) break; // county change
+              if (la.pmSuffix === 'R' || la.pmSuffix === 'L' || la.hgValue === 'R' || la.hgValue === 'L') {
+                // A sfx:R record whose desc is "BEGIN REALIGNMENT" is the trigger
+                // for the next section in the outer loop, not a continuation of the
+                // current one (sfx:L "BEGIN REALIGNMENT" records are consumed inside
+                // sections via the sfx/hg path and should not stop the lookahead).
+                // Stop without setting hasMoreRL so this dot record ends the section.
+                if (la.pmSuffix === 'R' && la.type === 'landmark' &&
+                    la.desc && la.desc.includes('BEGIN REALIGNMENT')) break;
+                hasMoreRL = true;
+                break;
+              }
+            }
+            if (hasMoreRL) {
+              i++;
+            } else {
+              break;
+            }
+          }
+        }
+        if (i === _iBeforeInner) i++;
+        const section = main.slice(j, i);
+        // Post-section absorption: absorb any immediately-following IA boundary
+        // records that are END markers for this alignment span. These can appear
+        // right after the section's last R/L record when the inner loop ends
+        // without an eq2 boundary (e.g. county mismatch stopped the sfx=R branch
+        // before it could consume END RIGHT INDEPENDENT ALIGNMENT).
+        // BEGIN records are excluded — they belong to the next section and are
+        // handled by the defer path in the outer-push else branch.
+        // Post-section absorption: scan ahead past any city boundary records
+        // (which can sort before IA END records at the same AR) and absorb
+        // immediately-following IA END records into this section.
+        // Uses a separate cursor so city boundaries stay in main[] for outer-push.
+        // No county guard — IA END records legitimately appear at county lines.
+        {
+          let lookK = i;
+          let lastIaEndAr = null;
+          while (lookK < main.length) {
+            const trailing = main[lookK];
+            const isCityBound = trailing.type === 'citybegin' || trailing.type === 'cityend';
+            if (isCityBound) { lookK++; continue; }
+            if (absorbedRecs.has(trailing)) { lookK++; continue; }
+            if (isIABoundaryRec(trailing)) {
+              if (/\bBEG/i.test(trailing.desc)) break;
+              tailSection.push(trailing); absorbedRecs.add(trailing);
+              lastIaEndAr = trailing.arMeasure;
+              lookK++; continue;
+            }
+            // After absorbing IA END records, also absorb any records within a small
+            // AR window. This prevents an L-alignment END REALIGNMENT (or its
+            // accompanying dot-suffix delimiter) that sorts slightly after the IA END
+            // boundaries from triggering a runaway section that swallows all subsequent
+            // records into its dotGroup.
+            if (lastIaEndAr != null &&
+                trailing.arMeasure != null && !isNaN(trailing.arMeasure) &&
+                Math.abs(trailing.arMeasure - lastIaEndAr) <= 0.5) {
+              if (trailing.county && sectionCounty && trailing.county !== sectionCounty) break;
+              tailSection.push(trailing); absorbedRecs.add(trailing); lookK++; continue;
+            }
+            break;
+          }
+        }
+        // Flush deferred pre-section R/L-sfx IA bounds (e.g. BEGIN LEFT INDEPENDENT
+        // ALIGNMENT that sorts before the first L ramp) into this section's allSec
+        // so they land in rGroup/lGroup rather than being outer-pushed.
+        const deferred = deferredIABounds.splice(0);
+        const allSec  = [...deferred, ...section, ...tailSection];
+        // IA boundary records (e.g. "END INDEP ALIGN - RT/LT") have sfx='.' but
+        // belong with their respective alignment group when absorbed into a section.
+        const isRtIA = p => isIABoundaryRec(p) && /\bRT\b/i.test(p.desc) && !/\bLT\b/i.test(p.desc);
+        const isLtIA = p => isIABoundaryRec(p) && /\bLT\b/i.test(p.desc) && !/\bRT\b/i.test(p.desc);
+        const rGroup   = allSec.filter(p => (p.pmSuffix === 'R' && (p.hgValue === 'R' || p.alignment === 'R')) || isRtIA(p));
+        const lGroup   = allSec.filter(p => p.pmSuffix === 'L' || isLtIA(p));
+        const eGroup   = allSec.filter(p => p.pmSuffix === 'E' && p.type !== 'equation');
+        const dotGroup = allSec.filter(p => p.pmSuffix !== 'R' && p.pmSuffix !== 'L' && p.pmSuffix !== 'E' && !isRtIA(p) && !isLtIA(p));
+        const rUnconf  = allSec.filter(p => p.pmSuffix === 'R' && p.hgValue !== 'R' && p.alignment !== 'R');
+        // R group: only R-suffix records confirmed on the R alignment by hgValue.
+        // R-suffix records with empty hgValue are not confirmed as R-alignment and
+        // go to the trailing bucket after the L group.
+        grouped.push(...rGroup);
+        // L group: all L-suffix records
+        grouped.push(...lGroup);
+        // E-suffix end markers (never equation records — eq2 uses sfx:E as a
+        // rendering marker and must not be grouped into the alignment section)
+        grouped.push(...eGroup);
+        // Trailing: dot-suffix records (END INDEP ALIGN landmarks via hgValue),
+        // then R-suffix records not confirmed by hgValue or alignment
+        grouped.push(...dotGroup);
+        grouped.push(...rUnconf);
+      } else {
+        const rec = main[i++];
+        if (isIABoundaryRec(rec) && (rec.pmSuffix === 'R' || rec.pmSuffix === 'L')) {
+          // R/L-sfx IA boundary before its section trigger (e.g. BEGIN LEFT INDEPENDENT
+          // ALIGNMENT before the first L ramp). Defer to flush into the next section.
+          deferredIABounds.push(rec);
+          continue;
+        }
+        grouped.push(rec);
+      }
+    }
+    // Flush any deferred IA bounds not claimed by a section (safety valve).
+    for (const p of deferredIABounds) grouped.push(p);
+
+    // Re-insert each eq1 immediately before its eq2 partner.
+    const result = [];
+    for (const p of grouped) {
+      if (p.type === 'equation' && p.isSecondEq) {
+        const eq1 = eq1ById.get(p.eqPairId);
+        if (eq1) result.push(eq1);
+      }
+      result.push(p);
+    }
+    return result;
+  }
+
+  // When two equation-pair records share the same AR to 3dp, the lower-AR tie-
+  // break used during sorting may not put them in the right order relative to
+  // the surrounding records. This pass checks the pmPrefix of the record
+  // immediately before and after each same-AR pair and swaps the PM data fields
+  // if doing so produces a better prefix match (eq1 continues from the prefix
+  // context before it; eq2 leads into the prefix context after it).
+  function fixEqPairOrder(pairs) {
+    for (let i = 0; i < pairs.length - 1; i++) {
+      const eq1 = pairs[i];
+      const eq2  = pairs[i + 1];
+      if (eq1.type !== 'equation' || eq1.isSecondEq)  continue;
+      if (eq2.type !== 'equation' || !eq2.isSecondEq) continue;
+      if (eq1.eqPairId !== eq2.eqPairId)              continue;
+
+      // Only act when both endpoints share the same AR to 3dp.
+      const ar1 = Math.round((eq1.arMeasure ?? 0) * 1000);
+      const ar2  = Math.round((eq2.arMeasure ?? 0) * 1000);
+      if (ar1 !== ar2) continue;
+
+      // Normalize prefix: treat '.' and '' as equivalent (no prefix).
+      // Equation records store dot-prefix as '' but landmark/other records store '.'.
+      const normPfx = p => (p === '.' || p == null || p === '') ? '' : p;
+      const eq1Pfx   = normPfx(eq1.pmPrefix);
+      const eq2Pfx   = normPfx(eq2.pmPrefix);
+
+      // Scan for the nearest context record on each side. Includes H, I, and R types;
+      // excludes equation records and any record whose PMMeasure matches either eq
+      // point (co-located records carry the arriving-system PM and give a wrong signal).
+      const eq1Pm = parseFloat(eq1.pmMeasure);
+      const eq2Pm = parseFloat(eq2.pmMeasure);
+      const isCtx = p => {
+        if (p.type === 'equation') return false;
+        const pm = parseFloat(p.pmMeasure);
+        if (!isNaN(pm)) {
+          if (!isNaN(eq1Pm) && Math.abs(pm - eq1Pm) < 0.001) return false;
+          if (!isNaN(eq2Pm) && Math.abs(pm - eq2Pm) < 0.001) return false;
+        }
+        return true;
+      };
+      let prevPfx = null, prevCounty = null;
+      for (let k = i - 1; k >= 0; k--) {
+        if (!isCtx(pairs[k])) continue;
+        prevPfx    = normPfx(pairs[k].pmPrefix);
+        prevCounty = pairs[k].county ?? null;
+        break;
+      }
+      let nextPfx = null, nextCounty = null;
+      for (let k = i + 2; k < pairs.length; k++) {
+        if (!isCtx(pairs[k])) continue;
+        nextPfx    = normPfx(pairs[k].pmPrefix);
+        nextCounty = pairs[k].county ?? null;
+        break;
+      }
+
+      let shouldSwap = false;
+      if (eq1Pfx !== eq2Pfx) {
+        // Prefix-based signal: preceding record should share prefix with eq1 (departing
+        // side). If eq2 matches the preceding context instead — swap.
+        // Secondary (no preceding): following record should match eq2 (arriving side).
+        if (prevPfx !== null) {
+          if (eq2Pfx === prevPfx && eq1Pfx !== prevPfx) shouldSwap = true;
+        } else if (nextPfx !== null) {
+          if (eq1Pfx === nextPfx && eq2Pfx !== nextPfx) shouldSwap = true;
+        }
+      } else {
+        // Same prefix (e.g. county-line PM reset, both sides have no prefix) —
+        // fall back to county as the distinguishing signal.
+        const eq1County = eq1.county ?? null;
+        const eq2County = eq2.county ?? null;
+        if (eq1County !== null && eq2County !== null && eq1County !== eq2County) {
+          if (prevCounty !== null) {
+            if (eq2County === prevCounty && eq1County !== prevCounty) shouldSwap = true;
+          } else if (nextCounty !== null) {
+            if (eq1County === nextCounty && eq2County !== nextCounty) shouldSwap = true;
+          }
+        }
+      }
+      if (!shouldSwap) continue;
+
+      // Swap PM-related data fields only — structural fields (desc, isSecondEq,
+      // eqPairId, type) stay in place so rendering labels are unaffected.
+      for (const f of ['pmPrefix', 'pmSuffix', 'pmMeasure', 'routeId', 'arMeasure', 'odMeasure', 'county', 'name']) {
+        const tmp = eq1[f]; eq1[f] = eq2[f]; eq2[f] = tmp;
+      }
+    }
+    return pairs;
+  }
+
+  function pickBest(locs) {
+    const valid = locs.filter(l =>
+      l.routeId != null &&
+      l.measure != null &&
+      (!l.status || l.status === 'esriLocatingOK' || l.status === 'esriLocatingMultipleLocation')
+    );
+    if (valid.length === 0) return null;
+    return valid.reduce((a, b) => b.measure > a.measure ? b : a);
+  }
+
+  // ── Shared: Query method dispatch ────────────────────────────────────────
+  // runDistrictRouteMode / runTranslate each check the active report and
+  // delegate to the appropriate per-report implementation below.
+  // To add a new report: add a dispatch branch here and a matching section.
+
+  function checkTranslateReady() {
+    ['from-county', 'to-county'].forEach(id => {
+      document.getElementById(id).classList.toggle('has-value', !!document.getElementById(id).value);
+    });
+    const ready =
+      document.getElementById('from-county').value        &&
+      document.getElementById('from-routeNum').value.trim() &&
+      document.getElementById('from-pmPrefix').value      &&
+      document.getElementById('from-pmSuffix').value      &&
+      document.getElementById('from-measure').value.trim() &&
+      document.getElementById('to-county').value          &&
+      document.getElementById('to-routeNum').value.trim() &&
+      document.getElementById('to-pmPrefix').value        &&
+      document.getElementById('to-pmSuffix').value        &&
+      document.getElementById('to-measure').value.trim();
+    document.getElementById('translateBtn').disabled = !ready;
+  }
+
+  function setFieldError(prefix, msg) {
+    const el = document.getElementById(`${prefix}-translate-error`);
+    if (!el) return;
+    el.textContent    = msg;
+    el.style.display  = msg ? 'block' : 'none';
+  }
+
+  // Translate one section (From or To) — returns { bestR, bestL } or throws
+  async function translateSection(routeIdR, routeIdL, measure) {
+    const body = new URLSearchParams({
+      locations:             JSON.stringify([
+        { routeId: routeIdR, measure },
+        { routeId: routeIdL, measure }
+      ]),
+      targetNetworkLayerIds: JSON.stringify([4]),
+      ...versionParam(),
+      ...historicMomentParam(),
+      f:     'json',
+      token: _token
+    });
+    const resp = await fetch(`${CONFIG.mapServiceUrl}/exts/LRServer/networkLayers/3/translate`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    body.toString()
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+    const data = await resp.json();
+    if (data.error) {
+      const code = data.error.code;
+      if (code === 498 || code === 499) { _token = null; login(); throw new Error('auth'); }
+      throw new Error(`API error ${code}: ${data.error.message}`);
+    }
+    const locs = data.locations ?? [];
+    return {
+      bestR: pickBest(locs[0]?.translatedLocations ?? []),
+      bestL: pickBest(locs[1]?.translatedLocations ?? [])
+    };
+  }
+
+  async function runTranslate() {
+    if (document.getElementById('reportSelect').value === 'highway_sequence')    { await hsl_runTranslate();  return; }
+    if (document.getElementById('reportSelect').value === 'Ramp_Summary')        { await rs_runTranslate();   return; }
+    if (document.getElementById('reportSelect').value === 'highway_log')         { await hl_runTranslate();   return; }
+    if (document.getElementById('reportSelect').value === 'intersection_detail') { await intd_runTranslate(); return; }
+    if (document.getElementById('reportSelect').value === 'intersection_summary'){ await ints_runTranslate(); return; }
+    if (!tokenIsValid()) { login(); return; }
+
+    const from = readSection('from');
+    const to   = readSection('to');
+
+    const fromMeasure = parseFloat(from.measureRaw);
+    if (isNaN(fromMeasure)) { showRampResults('error', 'From measure must be a number.'); return; }
+    const toMeasure = parseFloat(to.measureRaw);
+    if (isNaN(toMeasure)) { showRampResults('error', 'To measure must be a number.'); return; }
+
+    // Clear any previous per-field errors
+    setFieldError('from', '');
+    setFieldError('to',   '');
+
+    const fromRouteIdR = buildRouteId(from, 'R');
+    const fromRouteIdL = buildRouteId(from, 'L');
+    const toRouteIdR   = buildRouteId(to,   'R');
+    const toRouteIdL   = buildRouteId(to,   'L');
+
+    // Also translate L-pmSuffix variants to capture features calibrated on the L postmile route
+    const needsLAlt  = from.pmSuffix !== 'L';
+    const fromL      = { ...from, pmSuffix: 'L' };
+    const toL        = { ...to,   pmSuffix: 'L' };
+
+    const btn = document.getElementById('translateBtn');
+    btn.disabled = true;
+    startThinking(btn);
+    clearResults();
+
+    try {
+      // Translate primary and L-pmSuffix variants all in parallel
+      const [fromResult, toResult, fromAltResult, toAltResult] = await Promise.allSettled([
+        translateSection(fromRouteIdR, fromRouteIdL, fromMeasure),
+        translateSection(toRouteIdR,   toRouteIdL,   toMeasure),
+        needsLAlt ? translateSection(buildRouteId(fromL, 'R'), buildRouteId(fromL, 'L'), fromMeasure) : Promise.resolve(null),
+        needsLAlt ? translateSection(buildRouteId(toL,   'R'), buildRouteId(toL,   'L'), toMeasure)   : Promise.resolve(null)
+      ]);
+
+      // Error display only on primary results
+      let hasError = false;
+
+      if (fromResult.status === 'rejected') {
+        if (fromResult.reason?.message !== 'auth') setFieldError('from', 'INVALID LOCATION');
+        hasError = true;
+      } else if (!fromResult.value.bestR && !fromResult.value.bestL) {
+        setFieldError('from', 'INVALID LOCATION');
+        hasError = true;
+      }
+
+      if (toResult.status === 'rejected') {
+        if (toResult.reason?.message !== 'auth') setFieldError('to', 'INVALID LOCATION');
+        hasError = true;
+      } else if (!toResult.value.bestR && !toResult.value.bestL) {
+        setFieldError('to', 'INVALID LOCATION');
+        hasError = true;
+      }
+
+      if (hasError) return;
+
+      const { bestR: fromBestR, bestL: fromBestL } = fromResult.value;
+      const { bestR: toBestR,   bestL: toBestL   } = toResult.value;
+
+      // Pull alt (L-pmSuffix) results if available — used to widen the ARMeasure range
+      const fromAltV = fromAltResult.status === 'fulfilled' ? fromAltResult.value : null;
+      const toAltV   = toAltResult.status   === 'fulfilled' ? toAltResult.value   : null;
+
+      // Build a segment using the most inclusive From/To measures across both pmSuffix variants.
+      // Alt substitutes for primary when primary is null (e.g. only L-pmSuffix translates on that alignment).
+      const segments = [
+        makeSegment(fromBestR, fromAltV?.bestR, toBestR, toAltV?.bestR),
+        makeSegment(fromBestL, fromAltV?.bestL, toBestL, toAltV?.bestL)
+      ].filter(Boolean);
+
+      if (segments.length === 0) {
+        showRampResults('error', 'Translation failed for both R and L alignments.');
+        return;
+      }
+
+      const [rampPairs, direction] = await Promise.all([
+        queryAttributeSet(segments),
+        queryRouteDirection(from.routeNum.padStart(3, '0'))
+      ]);
+      _routeLabel    = from.routeNum.padStart(3, '0');
+      _directionFrom = direction.from;
+      _directionTo   = direction.to;
+
+      const allPairs = sortWithIndependentAlignments(rampPairs);
+
+      if (allPairs.length === 0) {
+        showRampResults('none');
+        return;
+      }
+
+      await queryRampDescriptions(allPairs);
+
+    } finally {
+      btn.disabled = false;
+      stopThinking(btn);
+    }
+  }
+
+  function isPaginated() {
+    return document.getElementById('paginatedCheck')?.checked !== false;
+  }
+
+  // ── Shared: State management & route direction ───────────────────────────
+
+  function clearResults() {
+    const rampBox = document.getElementById('rampResults');
+    rampBox.style.display = 'none';
+    rampBox.className = 'ramp-results';
+    rampBox.innerHTML = '';
+    _allResults              = [];
+    _unresolvedIntersections = [];
+    _currentPage   = 0;
+    _routeLabel    = '';
+    _directionFrom = '';
+    _directionTo   = '';
+    _hslLengths    = null;
+    _hslPageStarts = null;
+  }
+
+  async function queryRouteDirection(routeNum) {
+    const cacheKey = `${routeNum}:${getVersion()}`;
+    if (_routeDirectionCache.has(cacheKey)) return _routeDirectionCache.get(cacheKey);
+
+    const routeInt = parseInt(routeNum, 10);
+    if (isNaN(routeInt)) return { from: '', to: '' };
+    const params = new URLSearchParams({
+      where:          `ROUTE = ${routeInt}`,
+      outFields:      'FROM_,TO_',
+      returnGeometry: 'false',
+      ...versionParam(),
+      f:              'json',
+      token:          _token
+    });
+    try {
+      const resp = await fetch(`${CONFIG.mapServiceUrl}/304/query?${params}`);
+      const data = await resp.json();
+      if (data.features?.length > 0) {
+        const a = data.features[0].attributes;
+        const result = { from: a.FROM_ ?? '', to: a.TO_ ?? '' };
+        if (_routeDirectionCache.size >= 100) _routeDirectionCache.clear();
+        _routeDirectionCache.set(cacheKey, result);
+        return result;
+      }
+    } catch (e) {
+      console.error('[queryRouteDirection] error:', e.message);
+    }
+    return { from: '', to: '' };
+  }
+
+  // ── Shared: Core query functions ─────────────────────────────────────────
+  // queryAttributeSet, queryRangeLayer, and translateToOD are used by both
+  // the TSAR: Ramp Detail and HSL report pipelines.
+
+  /** Queries ramp point events from layers 132, 123 (via shared pipeline), and 151 for the given measure segments. */
+  async function queryAttributeSet(segments, district = null, county = null) {
+    // Build one OR clause per segment (each segment is one alignment: R or L)
+    // Small epsilon on both bounds absorbs floating-point drift from translate API
+    const segClauses = segments.flatMap(({ fromBest, toBest }) => {
+      const rid   = fromBest.routeId.endsWith('_S') ? fromBest.routeId.slice(0, -2) + '_P' : fromBest.routeId;
+      const ridS  = rid.slice(0, -1) + 'S';
+      const fromM = Math.min(fromBest.measure, toBest.measure) - 0.005;
+      const toM   = Math.max(fromBest.measure, toBest.measure) + 0.005;
+      return [
+        `(RouteID = '${rid}' AND ARMeasure >= ${fromM} AND ARMeasure <= ${toM})`,
+        `(RouteID = '${ridS}' AND ARMeasure >= ${fromM} AND ARMeasure <= ${toM})`
+      ];
+    });
+    const uniqueSegClauses = [...new Set(segClauses)];
+
+    const dateFilter     = getDateFilter();
+    const districtFilter = district != null ? ` AND District = ${parseInt(district, 10)}` : '';
+    const resolvedCounty = normalizeCountyCode(county);
+    const countyFilter   = resolvedCounty != null ? ` AND County = '${resolvedCounty.replace(/'/g, "''")}'` : '';
+    const where = uniqueSegClauses.length === 1
+      ? uniqueSegClauses[0].slice(1, -1) + districtFilter + countyFilter + ' AND LRSToDate IS NULL' + dateFilter
+      : `(${uniqueSegClauses.join(' OR ')})${districtFilter}${countyFilter} AND LRSToDate IS NULL${dateFilter}`;
+
+
+    // Layer 132 is a point event layer — use standard feature layer query
+    const body = new URLSearchParams({
+      where,
+      outFields:      'Ramp_Name,RouteID,ARMeasure,County,RouteNum,RouteSuffix,Alignment,PMPrefix,PMSuffix,PMMeasure,District,InventoryItemStartDate,InventoryItemEndDate',
+      orderByFields:  'ARMeasure ASC',
+      returnGeometry: 'true',
+      ...versionParam(),
+      f:              'json',
+      token:          _token
+    });
+
+
+    const allFeatures = [];
+    let offset = 0;
+    body.set('resultRecordCount', '1000');
+    while (true) {
+      body.set('resultOffset', String(offset));
+      let resp;
+      try {
+        resp = await fetch(`${CONFIG.mapServiceUrl}/132/query`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body:    body.toString()
+        });
+      } catch (e) {
+        console.error('[queryRamps] network error:', e.message);
+        return [];
+      }
+
+      if (!resp.ok) {
+        console.error('[queryRamps] HTTP', resp.status, resp.statusText);
+        return [];
+      }
+
+      let data;
+      try {
+        data = await resp.json();
+      } catch (e) {
+        console.error('[queryRamps] invalid JSON');
+        return [];
+      }
+
+      if (data.error) {
+        const code = data.error.code;
+        if (code === 498 || code === 499) { _token = null; login(); return []; }
+        console.error(`[queryRamps] API error ${code}: ${data.error.message}`);
+        return [];
+      }
+
+      const page = data.features;
+      if (!Array.isArray(page) || page.length === 0) break;
+      allFeatures.push(...page);
+      console.log(`[queryRamps] offset=${offset} got=${page.length} total=${allFeatures.length} exceeded=${!!data.exceededTransferLimit}`);
+      if (!data.exceededTransferLimit) break;
+      offset += page.length;
+    }
+
+    const features = allFeatures;
+
+    // Build unique pairs keyed by Ramp_Name (keep first occurrence per name)
+    const seenNames = new Set();
+    const pairs = [];
+    for (const f of features) {
+      const a = f.attributes ?? {};
+      const name = a.Ramp_Name;
+      if (name != null && name !== '' && !seenNames.has(name)) {
+        seenNames.add(name);
+        pairs.push({
+          type:        'ramp',
+          name,
+          routeId:     a.RouteID,
+          arMeasure:   a.ARMeasure,
+          odMeasure:   '',
+          county:      a.County      ?? '',
+          routeNum:    a.RouteNum    ?? '',
+          routeSuffix: a.RouteSuffix ?? '',
+          alignment:   a.Alignment   ?? '',
+          pmPrefix:    a.PMPrefix    ?? '',
+          pmSuffix:    a.PMSuffix    ?? '.',
+          pmMeasure:   a.PMMeasure   ?? '',
+          district:    a.District != null ? String(a.District).padStart(2, '0') : '',
+          startDate:   a.InventoryItemStartDate ?? null,
+          endDate:     a.InventoryItemEndDate   ?? null,
+          x:           f.geometry?.x ?? null,
+          y:           f.geometry?.y ?? null
+        });
+      }
+    }
+
+    // Translate AR → OD for all ramps so sort position reflects the
+    // reference-date network state rather than the stale stored ODMeasure.
+    const CHUNK = 200;
+    const chunks = chunkArray(pairs, CHUNK);
+    await Promise.all(chunks.map(async chunk => {
+      const locs = chunk.map(p => ({ routeId: p.routeId, measure: p.arMeasure }));
+      const xlateBody = new URLSearchParams({
+        locations:             JSON.stringify(locs),
+        targetNetworkLayerIds: JSON.stringify([5]),
+        ...versionParam(),
+        ...historicMomentParam(),
+        f:     'json',
+        token: _token
+      });
+      const xlateData = await fetch(
+        `${CONFIG.mapServiceUrl}/exts/LRServer/networkLayers/4/translate`,
+        { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: xlateBody.toString() }
+      ).then(r => r.json()).catch(() => ({ locations: [] }));
+      (xlateData.locations ?? []).forEach((loc, idx) => {
+        const xlated = loc.translatedLocations ?? [];
+        const result = xlated.find(r => r.measure != null)
+                    ?? xlated[0];
+        if (result?.measure != null) chunk[idx].odMeasure = String(result.measure);
+      });
+    }));
+    return pairs;
+  }
+
+  // ── Shared: Range-layer lookup & OD map ─────────────────────────────────
+
+  // Returns a Map of name → OD measure.
+  // OD measures are pre-populated on pairs that carry them (landmarks, equation points).
+  // Types without an OD measure (ramps, intersections) will have an empty string.
+  function translateToOD(allPairs) {
+    return new Map(allPairs.map(p => [p.name, p.odMeasure ?? '']));
+  }
+
+  // Returns a Map of name → fieldName value for range-based event layers (e.g. 116, 74)
+  // For _S records, both _P and _S RouteIDs are queried — city/HG ranges on L independent
+  // alignments may be stored under _S and would be missed if only _P is queried.
+  async function queryRangeLayer(pairs, layerNum, fieldName, fromField = 'FromARMeasure', toField = 'ToARMeasure') {
+    // Build one range query per unique lookup routeId rather than one OR clause
+    // per point. This keeps request count at O(alignments) instead of O(records/100),
+    // avoiding connection bursts on long routes (e.g. All/All/101).
+    const routeRanges = new Map(); // lookupId → { ridS, minAR, maxAR }
+    for (const p of pairs) {
+      if (p.routeId == null) continue;
+      const isUnderscoreS = p.routeId.endsWith('_S');
+      const isPlainS      = !isUnderscoreS && p.routeId.endsWith('S');
+      const isS  = isUnderscoreS || isPlainS;
+      const rid  = isUnderscoreS ? p.routeId.slice(0, -2) + '_P'
+                 : isPlainS      ? p.routeId.slice(0, -1) + 'P'
+                 : p.routeId;
+      const ridS = isS ? p.routeId : null;
+      const m = (layerNum === 116 || layerNum === 74)
+        ? p.arMeasure
+        : ((p.odMeasure !== '' && p.odMeasure != null) ? parseFloat(p.odMeasure) : p.arMeasure);
+      if (m == null || isNaN(m)) continue;
+      if (!routeRanges.has(rid)) routeRanges.set(rid, { ridS, minAR: m, maxAR: m });
+      const entry = routeRanges.get(rid);
+      if (m < entry.minAR) entry.minAR = m;
+      if (m > entry.maxAR) entry.maxAR = m;
+      if (ridS && !entry.ridS) entry.ridS = ridS;
+    }
+
+    const allFeatures = (await Promise.all([...routeRanges.entries()].map(async ([rid, { ridS, minAR, maxAR }]) => {
+      const routeClause = ridS ? `(RouteID = '${rid}' OR RouteID = '${ridS}')` : `RouteID = '${rid}'`;
+      const body = new URLSearchParams({
+        where:          `${routeClause} AND ${toField} >= ${minAR} AND ${fromField} <= ${maxAR}${getDateFilter()}`,
+        outFields:      `RouteID,${fromField},${toField},${fieldName}`,
+        returnGeometry: 'false',
+        ...versionParam(),
+        f:              'json',
+        token:          _token
+      });
+      try {
+        const resp = await fetch(`${CONFIG.mapServiceUrl}/${layerNum}/query`, {
+          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body.toString()
+        });
+        const data = await resp.json();
+        if (data.error) {
+          const code = data.error.code;
+          if (code === 498 || code === 499) { _token = null; login(); }
+          console.error(`[queryRangeLayer/${layerNum}] API error ${code}: ${data.error.message}`);
+          return [];
+        }
+        return Array.isArray(data.features) ? data.features : [];
+      } catch (e) {
+        console.error(`[queryRangeLayer/${layerNum}] error:`, e.message);
+        return [];
+      }
+    }))).flat();
+
+    const byRoute = new Map();
+    const seenFeature = new Set();
+    for (const f of allFeatures) {
+      const rid = f.attributes?.RouteID;
+      if (rid == null) continue;
+      const dedupeKey = `${rid}|${f.attributes?.[fromField]}|${f.attributes?.[toField]}|${f.attributes?.[fieldName]}`;
+      if (seenFeature.has(dedupeKey)) continue;
+      seenFeature.add(dedupeKey);
+      if (!byRoute.has(rid)) byRoute.set(rid, []);
+      byRoute.get(rid).push(f);
+    }
+    const map = new Map();
+    for (const p of pairs) {
+      const isUnderscoreS = p.routeId.endsWith('_S');
+      const isPlainS      = !isUnderscoreS && p.routeId.endsWith('S');
+      const isS       = isUnderscoreS || isPlainS;
+      const lookupId  = isUnderscoreS ? p.routeId.slice(0, -2) + '_P'
+                      : isPlainS      ? p.routeId.slice(0, -1) + 'P'
+                      : p.routeId;
+      const lookupIdS = isS ? p.routeId : null;
+      const m = (layerNum === 116 || layerNum === 74)
+        ? p.arMeasure
+        : ((p.odMeasure !== '' && p.odMeasure != null) ? parseFloat(p.odMeasure) : p.arMeasure);
+      const candidatesP = byRoute.get(lookupId)  ?? [];
+      const candidatesS = lookupIdS ? (byRoute.get(lookupIdS) ?? []) : [];
+      const tryMatch = (cands) => cands.filter(f => {
+        const from = f.attributes?.[fromField];
+        const to   = f.attributes?.[toField];
+        return from != null && to != null && m >= from && m <= to;
+      });
+      // For secondary-alignment records prefer S candidates (city stored on secondary);
+      // fall back to P candidates if no S match found (HG stored on primary).
+      let matches = isS ? tryMatch(candidatesS) : [];
+      if (matches.length === 0) matches = tryMatch(candidatesP);
+      // For non-116 layers: OD measure may diverge from AR; fall back to AR when
+      // the OD lookup returns nothing.
+      if (layerNum !== 116 && matches.length === 0 && p.arMeasure != null && p.arMeasure !== m) {
+        if (isS) matches = candidatesS.filter(f => {
+          const from = f.attributes?.[fromField];
+          const to   = f.attributes?.[toField];
+          return from != null && to != null && p.arMeasure >= from && p.arMeasure <= to;
+        });
+        if (matches.length === 0) matches = candidatesP.filter(f => {
+          const from = f.attributes?.[fromField];
+          const to   = f.attributes?.[toField];
+          return from != null && to != null && p.arMeasure >= from && p.arMeasure <= to;
+        });
+      }
+      // When multiple ranges share the same boundary point, prefer the one whose
+      // from-measure is highest — i.e. the range that *starts* at the boundary
+      // rather than the range that merely *ends* there.
+      const match = matches.length > 1
+        ? matches.reduce((best, f) => f.attributes[fromField] > best.attributes[fromField] ? f : best)
+        : matches[0];
+
+      map.set(p.name, match?.attributes?.[fieldName] ?? '');
+    }
+    return map;
+  }
+
+  // ── Shared: Pagination ───────────────────────────────────────────────────
+
+  /**
+   * Factory that returns {changePage, changePageFirst, changePageLast} bound
+   * to the caller's state.  Each report passes its own getters/setters so the
+   * three functions never need to be duplicated.
+   * @param {()=>number}  getPage       - returns current page index
+   * @param {(n:number)=>void} setPage  - sets current page index
+   * @param {()=>number}  getTotalPages - returns total page count
+   * @param {()=>void}    render        - re-renders the current page
+   */
+  function makePageController(getPage, setPage, getTotalPages, render) {
+    return {
+      changePage(delta) {
+        const next = getPage() + delta;
+        if (next < 0 || next >= getTotalPages()) return;
+        setPage(next);
+        render();
+      },
+      changePageFirst() {
+        if (getPage() === 0) return;
+        setPage(0);
+        render();
+      },
+      changePageLast() {
+        const last = getTotalPages() - 1;
+        if (getPage() === last) return;
+        setPage(last);
+        render();
+      }
+    };
+  }
+
+  // Ramp detail / ramp summary pagination
+  const _rdPageCtrl = makePageController(
+    ()  => _currentPage,
+    v   => { _currentPage = v; },
+    ()  => Math.ceil(_allResults.length / PAGE_SIZE),
+    ()  => renderPage()
+  );
+  function changePage(delta)  { _rdPageCtrl.changePage(delta); }
+  function changePageFirst()  { _rdPageCtrl.changePageFirst(); }
+  function changePageLast()   { _rdPageCtrl.changePageLast(); }
+
+  async function printAll() {
+    if (document.getElementById('reportSelect').value === 'highway_sequence')    { hsl_printAll();  return; }
+    if (document.getElementById('reportSelect').value === 'Ramp_Summary')        { rs_printAll();   return; }
+    if (document.getElementById('reportSelect').value === 'intersection_detail') { intd_printAll(); return; }
+    if (document.getElementById('reportSelect').value === 'intersection_summary'){ ints_printAll(); return; }
+    const box = document.getElementById('rampResults');
+    const saved = box.innerHTML;
+
+    const rdTitle = await showPrompt('Enter report title:');
+    if (rdTitle === null) return;
+    const coverPage = buildCoverPage({
+      coverTitle:  'TSAR - RAMP DETAIL',
+      reportTitle: rdTitle,
+      refDate:     document.getElementById('refDate').value || null,
+      district:    document.getElementById('districtSelect').value || null,
+      county:      getDistrictCounty() || null,
+      route:       _routeLabel || null,
+    });
+
+    const routeDir = _routeLabel
+      ? `Route: ${esc(_routeLabel)}&emsp;&emsp;&emsp;Direction: ${esc(_directionFrom)} &ndash; ${esc(_directionTo)}`
+      : '';
+    const NCOLS = 13;
+    const thead = `<thead>
+      ${routeDir ? `<tr class="rd-print-route-row"><td colspan="${NCOLS}">${routeDir}</td></tr>` : ''}
+      <tr>
+        <th>Location</th><th>P<br>R<br>E</th><th>PM</th><th>DATE OF<br>RECORD</th>
+        <th>H<br>G</th><th>AREA 4</th><th>CITY CODE</th><th>R<br>U</th><th>O<br>F</th>
+        <th>AADT<br>YEAR</th><th>ADT</th><th>T<br>Y</th><th>Description</th>
+      </tr></thead>`;
+
+    const rows = _allResults.map(p => `<tr>
+      <td>${p.district && p.county ? `${esc(p.district)}-${esc(String(p.county).replace(/\.$/, ''))}-${esc(_routeLabel)}` : ''}</td>
+      <td>${p.pmPrefix && p.pmPrefix !== '.' ? esc(p.pmPrefix) : ''}</td>
+      <td>${esc(padMeasure(p.pmMeasure))}</td>
+      <td>${p.startDate != null ? esc(formatDate(p.startDate)) : ''}</td>
+      <td>${p.pmSuffix === 'L' ? 'L' : p.hwyGroup ? esc(p.hwyGroup) : ''}</td>
+      <td>${p.noLinearEvent ? '-' : p.area4 === 1 ? 'Y' : p.area4 === 0 ? 'N' : ''}</td>
+      <td>${p.cityCode ? esc(p.cityCode) : ''}</td>
+      <td>${p.popCode ? esc(p.popCode) : ''}</td>
+      <td>${p.noLinearEvent ? '-' : p.onOff === 0 ? 'F' : p.onOff === 1 ? 'N' : p.onOff === 2 ? 'Z' : ''}</td>
+      <td>${p.aadtYear ? esc(p.aadtYear) : ''}</td>
+      <td>${p.aadt != null ? String(p.aadt).padStart(6, '0') : ''}</td>
+      <td>${p.noLinearEvent ? '-' : p.rampDesign ? esc(p.rampDesign) : ''}</td>
+      <td>${p.noLinearEvent ? '<i>NO RAMP LINEAR EVENT</i>' : p.desc ? esc(p.desc) : ''}</td>
+    </tr>`).join('');
+
+    const generatedFooter = `<div class="generated-on">Generated on ${esc(_generatedOn)}</div>`;
+
+    box.innerHTML = `${coverPage}<table class="rd-print-table">${thead}<tbody>${rows}</tbody></table>${generatedFooter}`;
+    window.addEventListener('afterprint', () => { box.innerHTML = saved; }, { once: true });
+    window.print();
+  }
+
+  function exportToExcel() {
+    if (document.getElementById('reportSelect').value === 'highway_sequence')    { hsl_exportToExcel(); return; }
+    if (document.getElementById('reportSelect').value === 'Ramp_Summary')        { alert('Export is not yet available for Ramp Summary.');        return; }
+    if (document.getElementById('reportSelect').value === 'intersection_detail') { intd_exportToExcel(); return; }
+    if (document.getElementById('reportSelect').value === 'intersection_summary'){ ints_exportToExcel(); return; }
+    if (_allResults.length === 0) return;
+
+    const headers  = ['Location', '', 'PM', 'Date of Record', '', 'HG', 'Area 4', '', 'City Code', 'R/U', 'Description'];
+
+    const rows = _allResults.map((p) => {
+      return [
+        (p.district && p.county) ? `${p.district}-${String(p.county).replace(/\.$/, '')}-${_routeLabel}` : '',
+        (p.pmPrefix && p.pmPrefix !== '.') ? p.pmPrefix : '',
+        padMeasure(p.pmMeasure),
+        p.startDate != null ? formatDate(p.startDate) : '',
+        p.pmSuffix === 'E' ? 'E' : '',
+        p.pmSuffix === 'L' ? 'L' : (p.hwyGroup ?? ''),
+        p.area4 === 1 ? 'Y' : p.area4 === 0 ? 'N' : '',
+        p.cityCode    ?? '',
+        p.popCode     ?? '',
+        p.desc        ?? ''
+      ];
+    });
+
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'TSAR - Ramp Detail');
+    XLSX.writeFile(wb, 'highway_sequence_listing.xlsx');
+  }
+
+  // ── Shared: Utilities & date filters ─────────────────────────────────────
+
+  // Returns a Promise that resolves to the entered string, or null if cancelled.
+  function showPrompt(message) {
+    return new Promise(resolve => {
+      document.getElementById('promptModalMessage').textContent = message;
+      const input    = document.getElementById('promptModalInput');
+      const backdrop = document.getElementById('promptModal');
+      input.value = '';
+      backdrop.classList.add('open');
+      input.focus();
+      const ok     = document.getElementById('promptModalOk');
+      const cancel = document.getElementById('promptModalCancel');
+      function done(result) {
+        backdrop.classList.remove('open');
+        ok.removeEventListener('click',       onOk);
+        cancel.removeEventListener('click',   onCancel);
+        input.removeEventListener('keydown',  onKey);
+        resolve(result);
+      }
+      function onOk()     { done(input.value); }
+      function onCancel() { done(null); }
+      function onKey(e) {
+        if (e.key === 'Enter')  onOk();
+        if (e.key === 'Escape') onCancel();
+      }
+      ok.addEventListener('click',      onOk);
+      cancel.addEventListener('click',  onCancel);
+      input.addEventListener('keydown', onKey);
+    });
+  }
+
+  // Returns a Promise that resolves true (Yes) or false (No).
+  function showConfirm(message) {
+    return new Promise(resolve => {
+      document.getElementById('confirmModalMessage').textContent = message;
+      const backdrop = document.getElementById('confirmModal');
+      backdrop.classList.add('open');
+      const yes = document.getElementById('confirmModalYes');
+      const no  = document.getElementById('confirmModalNo');
+      function done(result) {
+        backdrop.classList.remove('open');
+        yes.removeEventListener('click', onYes);
+        no.removeEventListener('click',  onNo);
+        resolve(result);
+      }
+      function onYes() { done(true);  }
+      function onNo()  { done(false); }
+      yes.addEventListener('click', onYes);
+      no.addEventListener('click',  onNo);
+    });
+  }
+
+  // Formats a numeric measure as NNN.NNN (3 digits each side of decimal)
+  function formatDate(ts) {
+    const d = new Date(ts);
+    return `${String(d.getUTCMonth() + 1).padStart(2, '0')}/${String(d.getUTCDate()).padStart(2, '0')}/${d.getUTCFullYear()}`;
+  }
+
+  function padMeasure(val) {
+    if (val === '' || val == null) return '';
+    const num = parseFloat(val);
+    if (isNaN(num)) return '';
+    const [intPart, decPart] = num.toFixed(3).split('.');
+    const safeInt = intPart === '-0' ? '0' : intPart;
+    return safeInt.padStart(3, '0') + '.' + decPart;
+  }
+
+  function esc(str) {
+    return str
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function getDistrictCounty() {
+    const val = document.getElementById('districtCountySelect')?.value;
+    return val || null; // null means ALL → no filter
+  }
+
+  function getOnOffFilter() {
+    let val;
+    const onOffSection = document.getElementById('onOffSection');
+    if (onOffSection?.style.display !== 'none')
+      val = document.getElementById('onOffFilter')?.value;
+    else
+      val = document.getElementById('translateOnOffFilter')?.value;
+    return val === '' || val == null ? null : Number(val);
+  }
+
+  function getDateFilter(startField = 'InventoryItemStartDate', endField = 'InventoryItemEndDate') {
+    const val = document.getElementById('refDate').value; // "YYYY-MM-DD"
+    if (!val || !/^\d{4}-\d{2}-\d{2}$/.test(val)) return '';
+    const ts = `TIMESTAMP '${val} 00:00:00'`;
+    return ` AND ${startField} <= ${ts}` +
+           ` AND (${endField} IS NULL OR ${endField} > ${ts})`;
+  }
+
+  // ── Shared: Report header helpers ────────────────────────────────────────
+
+  // Builds the three-column action bar with optional Export/Print buttons.
+  // Pass null for onExport or onPrint to render an empty spacer instead.
+  function renderActionBar(line1, line2, line3, onExport, onPrint) {
+    const exportBtn = onExport ? `<button class="export-btn" onclick="${onExport}">Export</button>` : '<div></div>';
+    const printBtn  = onPrint  ? `<button class="export-btn" onclick="${onPrint}">Print</button>`   : '<div></div>';
+    const route3    = line3    ? `<div class="report-title-line3">${line3}</div>`                    : '';
+    return `<div class="report-action-bar">
+         ${exportBtn}
+         <div class="report-title">
+           <div class="report-title-line1">${line1}</div>
+           <div class="report-title-line2">${line2}</div>
+           ${route3}
+         </div>
+         ${printBtn}
+       </div>`;
+  }
+
+  // Builds a print cover page HTML string.
+  // coverTitle  : large title shown on the cover (e.g. "TSAR - RAMP DETAIL")
+  // reportTitle : value for the REPORT TITLE row
+  // refDate     : ISO date string (YYYY-MM-DD) or null
+  // district, county, route : strings or null for location criteria
+  function buildCoverPage({ coverTitle, reportTitle, refDate, district, county, route }) {
+    const fmtDate = (iso) => {
+      if (!iso) return '';
+      const [y, m, d] = iso.split('-');
+      return `${m}/${d}/${y}`;
+    };
+    const todayMDY = () => {
+      const n = new Date();
+      return `${String(n.getMonth()+1).padStart(2,'0')}/${String(n.getDate()).padStart(2,'0')}/${n.getFullYear()}`;
+    };
+    const cpRow = (name, val) =>
+      `<tr><td class="cp-name">${esc(name)}</td><td class="cp-sep">:</td><td>${esc(val)}</td></tr>`;
+    const locRows = [
+      district ? `<tr><td class="cp-name">DISTRICT</td><td class="cp-sep"></td><td>${esc(district)}</td></tr>` : '',
+      county   ? `<tr><td class="cp-name">COUNTY</td><td class="cp-sep"></td><td>${esc(county)}</td></tr>`   : '',
+      route    ? `<tr><td class="cp-name">ROUTE</td><td class="cp-sep"></td><td>${esc(route)}</td></tr>`     : '',
+    ].filter(Boolean).join('') || `<tr><td colspan="3">All Districts / All Counties / All Routes</td></tr>`;
+
+    return `<div class="rs-cover">
+       <div class="rs-cover-agency">California Department of Transportation</div>
+       <div class="rs-cover-report-title">${esc(coverTitle)}</div>
+       <div class="rs-cover-section">
+         <div class="rs-cover-section-label">REPORT PARAMETERS:</div>
+         <table class="rs-cover-table">
+           ${cpRow('REPORT DATE',    todayMDY())}
+           ${cpRow('REFERENCE DATE', fmtDate(refDate))}
+           ${cpRow('SUBMITTOR',      _portalUsername)}
+           ${cpRow('REPORT TITLE',   reportTitle)}
+         </table>
+       </div>
+       <div class="rs-cover-section">
+         <div class="rs-cover-section-label">LOCATION CRITERIA:</div>
+         <table class="rs-cover-table">${locRows}</table>
+       </div>
+     </div>`;
+  }

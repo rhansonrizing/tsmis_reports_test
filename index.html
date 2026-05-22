@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TSMIS Reports</title>
+  <script src="config.js"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="modal-backdrop" id="promptModal">
+  <div class="modal-box">
+    <div class="modal-message" id="promptModalMessage"></div>
+    <input type="text" id="promptModalInput" class="modal-input">
+    <div class="modal-actions">
+      <button class="modal-yes" id="promptModalOk">OK</button>
+      <button class="modal-no"  id="promptModalCancel">Cancel</button>
+    </div>
+  </div>
+</div>
+<div class="modal-backdrop" id="confirmModal">
+  <div class="modal-box">
+    <div class="modal-message" id="confirmModalMessage"></div>
+    <div class="modal-actions">
+      <button class="modal-yes" id="confirmModalYes">Yes</button>
+      <button class="modal-no"  id="confirmModalNo">No</button>
+    </div>
+  </div>
+</div>
+<div class="card">
+  <img src="caltranslogo.png" alt="Caltrans" class="caltrans-logo">
+  <div class="ssor-label">DATA PROVIDED VIA THE <span class="ssor-highlight">SSOR</span> | <span style="color:#9ca3af;">ARS</span></div>
+  <div class="page-header">
+    <div class="report-select-wrap">
+      <select id="reportSelect" style="display:none;">
+        <option value="" disabled selected hidden>-- Select report --</option>
+        <option value="highway_log">Highway Log</option>
+        <option value="highway_sequence">Highway Sequence Listing</option>
+        <option value="Ramp_Detail">TSAR: Ramp Detail</option>
+        <option value="Ramp_Summary">TSAR: Ramp Summary</option>
+      </select>
+      <div class="cs" id="customReport">
+        <div class="cs-trigger">
+          <span class="cs-value">-- Select report --</span>
+          <span class="cs-arrow">&#9660;</span>
+        </div>
+        <ul class="cs-list">
+          <li class="cs-option" data-value="highway_log">Highway Log</li>
+          <li class="cs-option" data-value="highway_sequence">Highway Sequence Listing</li>
+          <li class="cs-option" data-value="Ramp_Detail">TSAR: Ramp Detail</li>
+          <li class="cs-option" data-value="Ramp_Summary">TSAR: Ramp Summary</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div id="modeSelector" style="display:none;">
+    <div class="mode-selector">
+      <fieldset class="mode-selector-box">
+        <legend class="mode-selector-header">
+          <span class="mode-selector-label">Query Method</span>
+          <span class="mode-selector-line"></span>
+          <label class="mode-paginated-label">
+            <input type="checkbox" id="paginatedCheck" disabled>
+            PAGINATED
+          </label>
+        </legend>
+        <div class="mode-selector-btns">
+          <button class="mode-btn" id="modeBtnDistrictRoute" onclick="selectMode('districtRoute')" disabled>District / County / Route</button>
+          <button class="mode-btn" id="modeBtnRouteMeasure" onclick="selectMode('routeMeasure')" disabled>Postmile Locations</button>
+        </div>
+      </fieldset>
+    </div>
+  </div>
+
+  <div id="loginPrompt" style="display:none;">
+    <p>Authentication required to use this tool.</p>
+    <button class="btn-primary" onclick="login()" style="width:auto;margin:1rem auto 0;">
+      Sign In with ArcGIS
+    </button>
+  </div>
+
+  <div id="controlsGrid" style="display:none;">
+    <!-- Left column (col 1): District / County / Route -->
+    <div class="ctrl-row" id="districtRow" style="display:none;">
+      <label for="districtSelect">District</label>
+      <select id="districtSelect" onchange="onDistrictChange()">
+        <option value="" disabled hidden selected>-- Select District --</option>
+        <option value="">-- ALL --</option>
+        <option value="01">01</option>
+        <option value="02">02</option>
+        <option value="03">03</option>
+        <option value="04">04</option>
+        <option value="05">05</option>
+        <option value="06">06</option>
+        <option value="07">07</option>
+        <option value="08">08</option>
+        <option value="09">09</option>
+        <option value="10">10</option>
+        <option value="11">11</option>
+        <option value="12">12</option>
+      </select>
+    </div>
+    <div class="ctrl-row" id="districtCountyRow" style="display:none;">
+      <label for="districtCountySelect">County</label>
+      <select id="districtCountySelect" onchange="onCountyChange()" disabled>
+        <option value="" disabled hidden selected>-- Select County --</option>
+        <option value="">-- ALL --</option>
+      </select>
+    </div>
+    <div class="ctrl-row" id="districtRouteRow" style="display:none;">
+      <label id="districtRouteLbl" for="districtRouteSelect">Route</label>
+      <select id="districtRouteSelect" disabled>
+        <option value="" disabled hidden selected>-- Select Route --</option>
+      </select>
+    </div>
+    <!-- Right column (col 3): Version / Reference Date / On/Off -->
+    <div class="ctrl-row" id="versionCtrl">
+      <label for="versionSelect">Version</label>
+      <select id="versionSelect">
+        <option value="">Default</option>
+      </select>
+    </div>
+    <div class="ctrl-row" id="refDateWrap">
+      <label for="refDate">Reference Date</label>
+      <input type="date" id="refDate" />
+    </div>
+    <div class="ctrl-row" id="onOffSection" style="display:none;">
+      <label for="onOffFilter">On / Off Indicator</label>
+      <select id="onOffFilter">
+        <option value="">ALL</option>
+        <option value="1">ON</option>
+        <option value="0">OFF</option>
+        <option value="2">OTHER</option>
+      </select>
+    </div>
+    <div id="generateRow" style="display:none;">
+      <button class="btn-primary" id="districtRouteBtn" onclick="runDistrictRouteMode()" style="display:none;" disabled>Generate</button>
+    </div>
+  </div>
+
+  <form id="appForm" style="display:none;" onsubmit="return false;">
+
+    <!-- From Measure -->
+    <fieldset class="measure-section">
+      <legend class="section-hdr">From Measure</legend>
+      <div class="fields-row">
+        <div class="field">
+          <label for="from-county">County</label>
+          <select id="from-county" onchange="onFromCountyChange()"></select>
+        </div>
+        <div class="field">
+          <label for="from-routeNum">Route #</label>
+          <select id="from-routeNum" onchange="onFromRouteChange()" disabled>
+            <option value="" disabled hidden selected>-- Select Route --</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="from-pmPrefix">PM Prefix</label>
+          <select id="from-pmPrefix" onchange="onFromPmPrefixChange()" disabled>
+            <option value="" disabled hidden selected>-- Select Route First --</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="from-pmSuffix">PM Suffix</label>
+          <select id="from-pmSuffix" disabled>
+            <option value="" disabled hidden selected>-- Select Prefix First --</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="from-measure">Postmile</label>
+          <input type="text" id="from-measure" placeholder="e.g. 12.123" autocomplete="off" oninput="checkTranslateReady()">
+        </div>
+      </div>
+      <p id="from-translate-error" class="field-error"></p>
+    </fieldset>
+
+    <!-- To Measure -->
+    <fieldset class="measure-section">
+      <legend class="section-hdr">To Measure</legend>
+      <div class="fields-row">
+        <div class="field">
+          <label for="to-county">County</label>
+          <select id="to-county" onchange="onToCountyChange()" disabled>
+            <option value="" disabled hidden selected>-- Select Route First --</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="to-routeNum">Route #</label>
+          <select id="to-routeNum" disabled>
+            <option value="" disabled hidden selected>-- Select Route --</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="to-pmPrefix">PM Prefix</label>
+          <select id="to-pmPrefix" onchange="onToPmPrefixChange()" disabled>
+            <option value="" disabled hidden selected>-- Select County First --</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="to-pmSuffix">PM Suffix</label>
+          <select id="to-pmSuffix" disabled>
+            <option value="" disabled hidden selected>-- Select Prefix First --</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="to-measure">Postmile</label>
+          <input type="text" id="to-measure" placeholder="e.g. 12.123" autocomplete="off" oninput="checkTranslateReady()">
+        </div>
+      </div>
+      <p id="to-translate-error" class="field-error"></p>
+    </fieldset>
+
+    <div class="route-form-row" id="translateOnOffRow" style="margin-top:0.5rem;">
+      <label for="translateOnOffFilter">On/Off</label>
+      <select id="translateOnOffFilter">
+        <option value="">ALL</option>
+        <option value="1">ON</option>
+        <option value="0">OFF</option>
+        <option value="2">OTHER</option>
+      </select>
+    </div>
+
+    <button class="btn-primary" id="translateBtn" onclick="runTranslate()" disabled style="display:block;width:31.2rem;text-transform:uppercase;margin:0.75rem auto 0;">Generate</button>
+
+  </form>
+
+  <div id="rampResults" class="ramp-results" style="display:none;"></div>
+</div>
+<script src="shared.js"></script>
+<script src="ramp_detail.js"></script>
+<script src="hsl.js"></script>
+<script src="ramp_summary.js"></script>
+<script src="highway_log.js"></script>
+<script src="intersection_detail.js"></script>
+<script src="intersection_summary.js"></script>
+<script src="main.js"></script>
+</body>
+</html>
